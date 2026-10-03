@@ -687,8 +687,11 @@ function avatarUrl(author: any) {
     return `https://cdn.discordapp.com/embed/avatars/${idx}.png`;
 }
 
+// same as toLocaleString(), made once
+const LOCAL_DATE = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+
 function fmtDate(iso: string) {
-    return new Date(iso).toLocaleString();
+    return LOCAL_DATE.format(new Date(iso));
 }
 
 function fmtSize(n: number) {
@@ -983,10 +986,11 @@ function htmlMessages(messages: any[], guildId: string | undefined, savedAs?: Ma
 const RULE = "==============================================================";
 
 /** "9/15/26, 10:28 AM", the date style DiscordKit uses */
+// one formatter for every message (making a new one per date is what made big TXT exports slow)
+const DK_DATE = new Intl.DateTimeFormat("en-US", { month: "numeric", day: "numeric", year: "2-digit", hour: "numeric", minute: "2-digit" });
+
 function dkDate(iso: string | number | Date) {
-    return new Date(iso).toLocaleString("en-US", {
-        month: "numeric", day: "numeric", year: "2-digit", hour: "numeric", minute: "2-digit"
-    }).replace(/[\u202f\u00a0]/g, " ");
+    return DK_DATE.format(new Date(iso)).replace(/[\u202f\u00a0]/g, " ");
 }
 
 /** username, or username#1234 for old-style/bot accounts */
@@ -1657,7 +1661,7 @@ const guildPatch: NavContextMenuPatchCallback = (children, { guild }: { guild?: 
 export default definePlugin({
     name: "ChatExporter",
     description: "Export the full history of any channel, DM, group DM or thread, or every channel of a server, to TXT/HTML/JSON, no message limit, plus a .zip of the files people sent. Right-click a chat → Export Chat, right-click a server → Export All Channels, or type /exportchat (dates, one person, all channels, or just what's new since your last export). Saved to your Downloads folder.",
-    authors: [{ name: "Adamko-10", id: 0n }],
+    authors: [{ name: "Adamko-10", id: 0n }, { name: "Claude", id: 0n }],
     // on automatically after a (re)build, so it never silently sits disabled
     enabledByDefault: true,
     settings,

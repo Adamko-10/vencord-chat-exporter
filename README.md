@@ -16,7 +16,7 @@ Works in channels, threads, forum posts, DMs and group DMs. Saves as **TXT** (sa
 | option | what it does |
 |---|---|
 | `from` / `to` | date range: `2026-09-15`, `15.09.2026`, `15 sep`, `yesterday`, `7d` (7 days ago) or a message link. `to` includes that whole day. |
-| `since_last` | `True` = only what's new since your last export of this chat or server (remembered per chat, per server and per `user`). Gets all of it; *Max messages* doesn't apply. |
+| `since_last` | `True` = only what's new since your last export of this chat or server (with `user`: since the last export that had their messages). Gets all of it; *Max messages* doesn't apply. |
 | `user` | only this person's messages |
 | `channels` | `all channels in this server` = every channel and thread you can read (text, announcements, voice-channel chats, forum posts, archived threads), in one file with a section per channel |
 | `files` | `False` = don't download the files |

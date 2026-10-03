@@ -106,6 +106,8 @@ interface ExportMark {
     file?: string;
     /** messages it saved */
     count: number;
+    /** exports of one person's messages: their username */
+    name?: string;
 }
 
 const MARKS_KEY = "ChatExporter_lastExports";
@@ -153,23 +155,51 @@ function shortWhen(ms: number) {
     }
 }
 
-/** why since_last can't run here, and what to do instead */
-function noMarkMessage(scope: string, author: { id: string; name: string; } | undefined, server: boolean) {
-    const what = server ? "all-channels export of this server" : "export of this chat";
-    let msg = `There's no earlier ${what}${author ? ` with only ${author.name}'s messages` : ""} to carry on from. `
-        + "Exports are only remembered since this update, so do one normal export first"
-        + `${server ? " (with channels: all)" : ""}, or use from: with the date of your last one, e.g. \`from: 24.09.2026 22:38\`.`;
-    const other = Object.entries(marks)
-        .filter(([k]) => k.startsWith(scope + "|"))
-        .sort(([, a], [, b]) => b.at - a.at)[0];
-    if (other) {
-        const whoId = other[0].slice(scope.length + 1);
-        const whoName = whoId === "everyone" ? "" : UserStore.getUser(whoId)?.username ?? whoId;
-        msg += whoId === "everyone"
-            ? ` Your last one here (${shortWhen(other[1].at)}) was everyone's messages: leave user empty to carry on from that.`
-            : ` Your last one here (${shortWhen(other[1].at)}) was only ${whoName}'s messages: add user: @${whoName} to carry on from that.`;
+/** the earlier export that "since last export" carries on from */
+interface SinceFrom {
+    mark: ExportMark;
+    /** set when that export only had this one person's messages, and the new one is for everyone or someone else */
+    onlyFrom?: string;
+}
+
+/**
+ * Where "since last export" carries on from: the latest export here that had these messages
+ * (everyone's; for one person, theirs or everyone's, whichever went further). Without one,
+ * the latest export of anyone's messages here, so a one-person export still counts as "your last export".
+ * scope = channel id, or guildKey() for all-channels exports.
+ */
+function findMark(scope: string, author?: { id: string; }): SinceFrom | undefined {
+    const everyone = marks[markKey(scope)];
+    const own = author ? marks[markKey(scope, author)] : undefined;
+    if (everyone || own) {
+        const further = !own ? everyone! : !everyone ? own : cmpId(own.upToId, everyone.upToId) > 0 ? own : everyone;
+        return { mark: further };
     }
-    return msg;
+    let latest: [string, ExportMark] | undefined;
+    for (const [key, mark] of Object.entries(marks)) {
+        if (!key.startsWith(scope + "|")) continue;
+        const c = latest ? cmpId(mark.upToId, latest[1].upToId) : 1;
+        if (c > 0 || (c === 0 && mark.at > latest![1].at)) latest = [key, mark];
+    }
+    if (!latest) return undefined;
+    const whoId = latest[0].slice(scope.length + 1);
+    return { mark: latest[1], onlyFrom: UserStore.getUser(whoId)?.username ?? latest[1].name ?? whoId };
+}
+
+/** "your last export (3 Oct, 17:17)", saying so when that one only had one other person's messages */
+function lastExport(opts: ExportOptions, kind = "") {
+    const only = opts.sinceOnlyFrom ? `, which only had ${opts.sinceOnlyFrom}'s messages` : "";
+    return `your last ${kind}export (${shortWhen(opts.since!.at)}${only})`;
+}
+
+/** options for "Export New Messages": everything after where that export ended */
+const newSince = (found: SinceFrom): ExportOptions => ({ since: found.mark, sinceOnlyFrom: found.onlyFrom, range: { after: snowflakeToDate(found.mark.upToId) } });
+
+/** since_last where nothing was exported yet */
+function noMarkMessage(server: boolean) {
+    const what = server ? "all-channels export of this server" : "export of this chat";
+    return `There's no remembered ${what} to carry on from. Do one normal export${server ? " with channels: all" : ""} first, `
+        + "or use from: with the date of your last one, e.g. `from: 24.09.2026 22:38`.";
 }
 
 function cancelExport(state: ExportState) {
@@ -1360,6 +1390,8 @@ interface ExportOptions {
     files?: boolean;
     /** only what's newer than where this earlier export ended (all of it: "Max messages" doesn't apply) */
     since?: ExportMark;
+    /** that earlier export only had this person's messages (this one is for everyone or someone else) */
+    sinceOnlyFrom?: string;
 }
 
 /** keeps free space for the zip on top of the files themselves */
@@ -1447,7 +1479,7 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
     const startedAt = Date.now();
     const { since } = opts;
     const who = author ? ` (only messages from ${author.name})` : "";
-    const what = since ? ` since your last export (${shortWhen(since.at)})` : describeRange(range, discordLocale());
+    const what = since ? ` since ${lastExport(opts)}` : describeRange(range, discordLocale());
     noteToast(`Starting export of ${channelTitle(channel)}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the chat again"} to cancel)`);
     const report = reporter(opts, channel.id);
 
@@ -1458,7 +1490,7 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
         if (!messages.length) {
             const where = range.after || range.before ? " in that date range" : "";
             const why = state.cancelled ? "Export cancelled before any messages were found, nothing was saved."
-                : since ? `Nothing new${author ? ` from ${author.name}` : ""} since your last export (${shortWhen(since.at)}).`
+                : since ? `Nothing new${author ? ` from ${author.name}` : ""} since ${lastExport(opts)}.`
                     : author ? `No messages from ${author.name}${where} (looked through ${state.scanned.toLocaleString()}).`
                         : where ? "No messages in that date range." : "No messages found to export.";
             // "nothing new" is good news, not an error
@@ -1488,7 +1520,7 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
         });
         // the next "since last export" carries on right after the newest message looked at
         if (saved && state.newestId)
-            await rememberExport(markKey(channel.id, author), { upToId: state.newestId, at: startedAt, file: saved.shownAs, count: messages.length });
+            await rememberExport(markKey(channel.id, author), { upToId: state.newestId, at: startedAt, file: saved.shownAs, count: messages.length, name: author?.name });
     } catch (e: any) {
         await exportFailed(e, state, report);
     } finally {
@@ -1508,7 +1540,7 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
     const { since } = opts;
     const guildName = GuildStore.getGuild(guildId)?.name ?? "this server";
     const who = author ? ` (only messages from ${author.name})` : "";
-    const what = since ? ` since your last all-channels export (${shortWhen(since.at)})` : describeRange(range, discordLocale());
+    const what = since ? ` since ${lastExport(opts, "all-channels ")}` : describeRange(range, discordLocale());
     noteToast(`Starting export of all channels in ${guildName}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the server again"} to cancel)`);
     const report = reporter(opts);
 
@@ -1526,7 +1558,7 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
 
         if (!messages.length) {
             const why = state.cancelled ? "Export cancelled before any messages were found, nothing was saved."
-                : since ? `Nothing new${author ? ` from ${author.name}` : ""} in any of the ${summary.searched.length.toLocaleString()} channels and threads since your last all-channels export (${shortWhen(since.at)}).`
+                : since ? `Nothing new${author ? ` from ${author.name}` : ""} in any of the ${summary.searched.length.toLocaleString()} channels and threads since ${lastExport(opts, "all-channels ")}.`
                     : author ? `No messages from ${author.name}${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads (looked through ${state.scanned.toLocaleString()}).`
                         : `No messages${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads.`;
             toast(why, since && !state.cancelled ? "message" : "failure");
@@ -1573,7 +1605,7 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
             const upToId = prevId(dateToSnowflake(new Date(until)));
             const channels: Record<string, string> = {};
             for (const [id, newest] of state.newestByTarget ?? []) if (cmpId(newest, upToId) > 0) channels[id] = newest;
-            await rememberExport(markKey(key, author), { upToId, channels, at: startedAt, file: saved.shownAs, count: n });
+            await rememberExport(markKey(key, author), { upToId, channels, at: startedAt, file: saved.shownAs, count: n, name: author?.name });
         }
     } catch (e: any) {
         await exportFailed(e, state, report);
@@ -1611,14 +1643,14 @@ function makeItems(channel?: Channel) {
             action={() => exportChannel(channel, {})}
         />
     ];
-    const since = marks[markKey(channel.id)];
-    if (since)
+    const found = findMark(channel.id);
+    if (found)
         items.push(
             <Menu.MenuItem
                 key="vc-chat-export-new"
                 id="vc-chat-export-new"
-                label={`Export New Messages (since ${shortWhen(since.at)})`}
-                action={() => exportChannel(channel, { since, range: { after: snowflakeToDate(since.upToId) } })}
+                label={`Export New Messages (since ${shortWhen(found.mark.at)})`}
+                action={() => exportChannel(channel, newSince(found))}
             />
         );
     return items;
@@ -1650,13 +1682,13 @@ const guildPatch: NavContextMenuPatchCallback = (children, { guild }: { guild?: 
         return;
     }
     children.push(<Menu.MenuSeparator />, <Menu.MenuItem id="vc-chat-export-server" label="Export All Channels" action={() => exportServer(guild.id, {})} />);
-    const since = marks[markKey(key)];
-    if (since)
+    const found = findMark(key);
+    if (found)
         children.push(
             <Menu.MenuItem
                 id="vc-chat-export-server-new"
-                label={`Export New Messages, All Channels (since ${shortWhen(since.at)})`}
-                action={() => exportServer(guild.id, { since, range: { after: snowflakeToDate(since.upToId) } })}
+                label={`Export New Messages, All Channels (since ${shortWhen(found.mark.at)})`}
+                action={() => exportServer(guild.id, newSince(found))}
             />
         );
 };
@@ -1764,28 +1796,31 @@ export default definePlugin({
                 const author = userId ? { id: userId, name: UserStore.getUser(userId)?.username ?? userId } : undefined;
                 const files = findOption<boolean>(args, "files");
 
-                // since_last: carry on right after where the last export of the same thing ended
+                // since_last: carry on right after where the latest export here ended (see findMark)
                 let since: ExportMark | undefined;
-                const scope = allChannels ? guildKey(channel.guild_id) : channel.id;
+                let sinceOnlyFrom: string | undefined;
                 if (sinceLast) {
                     await loadMarks();
-                    since = marks[markKey(scope, author)];
-                    if (!since) {
-                        sendBotMessage(channel.id, { content: noMarkMessage(scope, author, allChannels) });
+                    const found = findMark(allChannels ? guildKey(channel.guild_id) : channel.id, author);
+                    if (!found) {
+                        sendBotMessage(channel.id, { content: noMarkMessage(allChannels) });
                         return;
                     }
+                    since = found.mark;
+                    sinceOnlyFrom = found.onlyFrom;
                     // shown in the notes and the file header ("After: ..."); the exact cut is the message id
                     parsed.range.after = snowflakeToDate(since.upToId);
                 }
 
                 // say how everything was understood, so a misread 3/9 is easy to spot and cancel
                 const who = author ? ` (only messages from ${author.name})` : "";
-                const opts: ExportOptions = { format: fmt, fromCommand: true, reportTo: channel.id, range: parsed.range, author, files: typeof files === "boolean" ? files : undefined, since };
+                const opts: ExportOptions = { format: fmt, fromCommand: true, reportTo: channel.id, range: parsed.range, author, files: typeof files === "boolean" ? files : undefined, since, sinceOnlyFrom };
                 const max = settings.store.maxMessages;
                 const limit = max && !since ? ` Stops at ${max.toLocaleString()} messages (your "Max messages" setting), keeping the newest.` : "";
                 const what = describeRange(parsed.range, locale);
-                // "since your last export (Thu, 24 Sept 2026, 22:38, `Downloads\...html`)"
-                const lastOne = since && `since your last ${allChannels ? "all-channels " : ""}export (${niceDate(new Date(since.at), locale)}${since.file ? `, \`${since.file}\`` : ""})`
+                // "since your last export (Thu, 24 Sept 2026, 22:38, `Downloads\...html`)", plus whose messages it had if only one other person's
+                const lastOne = since && `since your last ${allChannels ? "all-channels " : ""}export (${niceDate(new Date(since.at), locale)}${since.file ? `, \`${since.file}\`` : ""}`
+                    + `${sinceOnlyFrom ? `, which only had ${sinceOnlyFrom}'s messages` : ""})`
                     + (parsed.range.before ? ` up to ${niceDate(new Date(parsed.range.before.getTime() - 1), locale)}` : "");
                 if (allChannels) {
                     const server = GuildStore.getGuild(channel.guild_id)?.name ?? "this server";

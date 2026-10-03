@@ -70,7 +70,7 @@ No. Measured with realistic Discord messages in the same JavaScript engine Disco
 
 - **When you're not exporting** it does nothing: no timers, no background checks, no polling. Apart from reading its small list of remembered exports at startup, it only reacts when you right-click or type `/exportchat`.
 - **CPU:** an export mostly waits on Discord (one request per 100 messages plus a deliberate 300 ms pause, so it never spams the API). Building the file at the end takes about 0.25 s for TXT and under 1 s for HTML, even for 100,000 messages.
-- **RAM:** about 1 KB per message while an export runs (10,000 messages ≈ 11 MB, 100,000 ≈ 106 MB), plus roughly the file's size for a moment while saving. It's all freed when the export is done. JSON is the heaviest format for huge chats because it's the raw API data.
+- **RAM:** about 1 KB per message while an export runs (10,000 messages ≈ 11 MB, 100,000 ≈ 106 MB). Saving briefly needs a few times the file's size on top: a 100,000-message export peaks around 180 MB as TXT and 260 MB as HTML. It's all freed when the export is done. JSON is the heaviest format for huge chats because it's the raw API data.
 - **Files** are streamed straight to disk in small chunks, so a few GB of attachments still only use a few MB of RAM.
 
 ## Good to know

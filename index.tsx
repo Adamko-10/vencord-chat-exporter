@@ -11,7 +11,7 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { saveFile } from "@utils/web";
 import type { Channel, User } from "@vencord/discord-types";
-import { ChannelStore, Constants, GuildRoleStore, GuildStore, LocaleStore, Menu, PermissionsBits, PermissionStore, RestAPI, showToast, Toasts, UserStore } from "@webpack/common";
+import { ChannelStore, Constants, GuildRoleStore, GuildStore, LocaleStore, Menu, PermissionsBits, PermissionStore, RestAPI, showToast, UserStore } from "@webpack/common";
 
 import { buildRange, DateRange, dateToSnowflake, describeRange, niceDate, snowflakeToDate } from "./dateRange";
 import { uniqueZipName, zipNameFor } from "./zipNames";
@@ -188,7 +188,10 @@ function discordLocale(): string | undefined {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-function toast(msg: string, type = Toasts.Type.MESSAGE) {
+// plain strings: Vencord dropped its toast-type constants in October 2026, and strings work on old and new versions
+type ToastKind = "message" | "success" | "failure";
+
+function toast(msg: string, type: ToastKind = "message") {
     showToast(msg, type);
 }
 
@@ -203,7 +206,7 @@ function progressToast(msg: string) {
     const now = Date.now();
     if (now - lastProgressToast < PROGRESS_GAP_MS) return false;
     lastProgressToast = now;
-    showToast(msg, Toasts.Type.MESSAGE, { duration: PROGRESS_SHOWN_MS });
+    showToast(msg, "message", { duration: PROGRESS_SHOWN_MS });
     return true;
 }
 
@@ -1211,7 +1214,7 @@ async function downloadFiles(plan: ReturnType<typeof planFiles>, exportPath: str
     const start = await native.zipStart(exportPath, totalBytes);
     if (!start.id) {
         const msg = `Couldn't download the files: ${start.error ?? "unknown problem"}. The messages were saved without them.`;
-        toast(msg, Toasts.Type.FAILURE);
+        toast(msg, "failure");
         report(msg);
         if (settings.store.openFolder) native.showInFolder(exportPath);
         return;
@@ -1299,7 +1302,7 @@ async function downloadFiles(plan: ReturnType<typeof planFiles>, exportPath: str
             msg += listSaved ? ", the list is inside the zip." : ".";
         }
     }
-    toast(msg.replace(/`/g, ""), savedCount ? Toasts.Type.SUCCESS : Toasts.Type.FAILURE);
+    toast(msg.replace(/`/g, ""), savedCount ? "success" : "failure");
     report(msg);
 }
 
@@ -1400,7 +1403,7 @@ async function saveEverything(state: ExportState, opts: ExportOptions, report: (
         const free = await native.freeSpace();
         if (free !== null && free < plan.totalBytes + SPACE_MARGIN) {
             const msg = `Not enough free space for the files: they need about ${fmtSize(plan.totalBytes)}, but only ${fmtSize(free)} is free. Saving only the messages.`;
-            toast(msg, Toasts.Type.FAILURE);
+            toast(msg, "failure");
             report(msg);
             plan = null;
         }
@@ -1416,7 +1419,7 @@ async function saveEverything(state: ExportState, opts: ExportOptions, report: (
         report("Export cancelled, nothing was saved.");
         return null;
     }
-    toast(`Saved ${what} to ${saved.shownAs}`, Toasts.Type.SUCCESS);
+    toast(`Saved ${what} to ${saved.shownAs}`, "success");
     report(`Saved ${what} to \`${saved.shownAs}\``);
 
     if (plan && saved.path) await downloadFiles(plan, saved.path, state, report);
@@ -1425,7 +1428,7 @@ async function saveEverything(state: ExportState, opts: ExportOptions, report: (
 
 async function exportFailed(e: any, state: ExportState, report: (s: string) => void) {
     console.error("[ChatExporter]", e);
-    toast(`Export failed: ${e?.message ?? e}`, Toasts.Type.FAILURE);
+    toast(`Export failed: ${e?.message ?? e}`, "failure");
     report(`Export failed: ${e?.message ?? e}`);
     const native = getNative();
     if (state.zipId && native) {
@@ -1459,7 +1462,7 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
                     : author ? `No messages from ${author.name}${where} (looked through ${state.scanned.toLocaleString()}).`
                         : where ? "No messages in that date range." : "No messages found to export.";
             // "nothing new" is good news, not an error
-            toast(why, since && !state.cancelled ? Toasts.Type.MESSAGE : Toasts.Type.FAILURE);
+            toast(why, since && !state.cancelled ? "message" : "failure");
             report(why);
             return;
         }
@@ -1526,7 +1529,7 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
                 : since ? `Nothing new${author ? ` from ${author.name}` : ""} in any of the ${summary.searched.length.toLocaleString()} channels and threads since your last all-channels export (${shortWhen(since.at)}).`
                     : author ? `No messages from ${author.name}${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads (looked through ${state.scanned.toLocaleString()}).`
                         : `No messages${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads.`;
-            toast(why, since && !state.cancelled ? Toasts.Type.MESSAGE : Toasts.Type.FAILURE);
+            toast(why, since && !state.cancelled ? "message" : "failure");
             report(state.cancelled ? why : [why, ...notes].join(" "));
             return;
         }

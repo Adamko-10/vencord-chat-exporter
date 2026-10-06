@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { ApplicationCommandInputType, ApplicationCommandOptionType, findOption, sendBotMessage } from "@api/Commands";
-import { NavContextMenuPatchCallback } from "@api/ContextMenu";
-import * as DataStore from "@api/DataStore";
+import type { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { saveFile } from "@utils/web";
 import type { Channel, User } from "@vencord/discord-types";
-import { ChannelStore, Constants, GuildRoleStore, GuildStore, LocaleStore, Menu, PermissionsBits, PermissionStore, RestAPI, showToast, UserStore } from "@webpack/common";
 
+// everything else from Vencord and Discord goes through compat.ts, so their updates don't break the plugin
+import { botMessage, browserDownload, BUILT_IN_COMMAND, canRead, checkParts, discordLocale, dmChannelId, getChannel, getGuild, getRole, getUser, guildChannels, isDesktopApp, loadedThreads, menuParts, messagesPath, MissingPartError, option, OptionKind, restGet, showToast, storeGet, storeSet, ToastKind } from "./compat";
 import { buildRange, DateRange, dateToSnowflake, describeRange, niceDate, snowflakeToDate } from "./dateRange";
+import { linksIn } from "./links";
 import { uniqueZipName, zipNameFor } from "./zipNames";
 
 const settings = definePluginSettings({
@@ -111,16 +110,18 @@ interface ExportMark {
 }
 
 const MARKS_KEY = "ChatExporter_lastExports";
-/** "<channel id or guild:id>|<everyone or user id>" -> where the last export of that ended */
+/**
+ * "<channel id or guild:id>|<everyone or user id>" -> where the last export of that ended.
+ * Links-only exports keep their own: "<channel id or guild:id>|links|<everyone or user id>"
+ * (they don't save the messages, so a normal since_last must not carry on from them).
+ */
 let marks: Record<string, ExportMark> = {};
 let marksLoading: Promise<void> | null = null;
 
-const markKey = (scope: string, author?: { id: string; }) => `${scope}|${author?.id ?? "everyone"}`;
+const markKey = (scope: string, author?: { id: string; }, links = false) => `${scope}|${links ? "links|" : ""}${author?.id ?? "everyone"}`;
 
 function loadMarks() {
-    marksLoading ??= DataStore.get<Record<string, ExportMark>>(MARKS_KEY)
-        .then(v => { marks = { ...(v ?? {}), ...marks }; })
-        .catch(e => console.warn("[ChatExporter] couldn't load the remembered exports", e));
+    marksLoading ??= storeGet<Record<string, ExportMark>>(MARKS_KEY).then(v => { marks = { ...(v ?? {}), ...marks }; });
     return marksLoading;
 }
 
@@ -138,11 +139,7 @@ async function rememberExport(key: string, mark: ExportMark) {
             if (cmpId(upTo, mark.upToId) > 0 && (!mark.channels[id] || cmpId(upTo, mark.channels[id]) > 0)) mark.channels[id] = upTo;
     }
     marks[key] = mark;
-    try {
-        await DataStore.set(MARKS_KEY, marks);
-    } catch (e) {
-        console.warn("[ChatExporter] couldn't save where the export ended", e);
-    }
+    await storeSet(MARKS_KEY, marks);
 }
 
 /** "24 Sept, 22:38" */
@@ -166,39 +163,41 @@ interface SinceFrom {
  * Where "since last export" carries on from: the latest export here that had these messages
  * (everyone's; for one person, theirs or everyone's, whichever went further). Without one,
  * the latest export of anyone's messages here, so a one-person export still counts as "your last export".
- * scope = channel id, or guildKey() for all-channels exports.
+ * scope = channel id, or guildKey() for all-channels exports. links = look at links-only exports instead.
  */
-function findMark(scope: string, author?: { id: string; }): SinceFrom | undefined {
-    const everyone = marks[markKey(scope)];
-    const own = author ? marks[markKey(scope, author)] : undefined;
+function findMark(scope: string, author?: { id: string; }, links = false): SinceFrom | undefined {
+    const everyone = marks[markKey(scope, undefined, links)];
+    const own = author ? marks[markKey(scope, author, links)] : undefined;
     if (everyone || own) {
         const further = !own ? everyone! : !everyone ? own : cmpId(own.upToId, everyone.upToId) > 0 ? own : everyone;
         return { mark: further };
     }
+    const prefix = `${scope}|${links ? "links|" : ""}`;
     let latest: [string, ExportMark] | undefined;
     for (const [key, mark] of Object.entries(marks)) {
-        if (!key.startsWith(scope + "|")) continue;
+        if (!key.startsWith(prefix) || (!links && key.startsWith(`${scope}|links|`))) continue;
         const c = latest ? cmpId(mark.upToId, latest[1].upToId) : 1;
         if (c > 0 || (c === 0 && mark.at > latest![1].at)) latest = [key, mark];
     }
     if (!latest) return undefined;
-    const whoId = latest[0].slice(scope.length + 1);
-    return { mark: latest[1], onlyFrom: UserStore.getUser(whoId)?.username ?? latest[1].name ?? whoId };
+    const whoId = latest[0].slice(prefix.length);
+    return { mark: latest[1], onlyFrom: getUser(whoId)?.username ?? latest[1].name ?? whoId };
 }
 
 /** "your last export (3 Oct, 17:17)", saying so when that one only had one other person's messages */
 function lastExport(opts: ExportOptions, kind = "") {
     const only = opts.sinceOnlyFrom ? `, which only had ${opts.sinceOnlyFrom}'s messages` : "";
-    return `your last ${kind}export (${shortWhen(opts.since!.at)}${only})`;
+    return `your last ${kind}${opts.links ? "links " : ""}export (${shortWhen(opts.since!.at)}${only})`;
 }
 
 /** options for "Export New Messages": everything after where that export ended */
 const newSince = (found: SinceFrom): ExportOptions => ({ since: found.mark, sinceOnlyFrom: found.onlyFrom, range: { after: snowflakeToDate(found.mark.upToId) } });
 
 /** since_last where nothing was exported yet */
-function noMarkMessage(server: boolean) {
-    const what = server ? "all-channels export of this server" : "export of this chat";
-    return `There's no remembered ${what} to carry on from. Do one normal export${server ? " with channels: all" : ""} first, `
+function noMarkMessage(server: boolean, links = false) {
+    const what = `${server ? "all-channels " : ""}${links ? "links " : ""}export of this ${server ? "server" : "chat"}`;
+    const first = links ? `one export with links: True${server ? " and channels: all" : ""}` : `one normal export${server ? " with channels: all" : ""}`;
+    return `There's no remembered ${what} to carry on from. Do ${first} first, `
         + "or use from: with the date of your last one, e.g. `from: 24.09.2026 22:38`.";
 }
 
@@ -207,19 +206,7 @@ function cancelExport(state: ExportState) {
     if (state.zipId) getNative()?.zipCancel?.(state.zipId);
 }
 
-/** Discord's language, e.g. "en-GB" (decides whether 3/9 means 3 Sep or 9 Mar) */
-function discordLocale(): string | undefined {
-    try {
-        return LocaleStore?.locale || undefined;
-    } catch {
-        return undefined;
-    }
-}
-
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-// plain strings: Vencord dropped its toast-type constants in October 2026, and strings work on old and new versions
-type ToastKind = "message" | "success" | "failure";
 
 function toast(msg: string, type: ToastKind = "message") {
     showToast(msg, type);
@@ -253,13 +240,18 @@ class ApiError extends Error {
     }
 }
 
+/** a part of Vencord or Discord that changed, not a network hiccup: trying again won't help */
+const isBroken = (e: any) => e instanceof MissingPartError || e instanceof ReferenceError
+    || (e instanceof TypeError && /is not a function|Cannot read properties|is (undefined|null|not an object)/.test(e.message));
+
 /** GET from Discord's API, waiting out rate limits and retrying hiccups */
 async function apiGet(url: string, query?: Record<string, any>): Promise<any> {
     for (let attempt = 0; attempt < 20; attempt++) {
         try {
-            const res = await RestAPI.get({ url, query, retries: 2 });
+            const res = await restGet(url, query);
             return res.body;
         } catch (e: any) {
+            if (isBroken(e)) throw e;
             const status = e?.status;
             if (status === 429) {
                 const wait = Math.ceil((e?.body?.retry_after ?? 5) * 1000) + 250;
@@ -279,7 +271,7 @@ async function apiGet(url: string, query?: Record<string, any>): Promise<any> {
 
 async function fetchPage(channelId: string, before?: string): Promise<any[]> {
     try {
-        const body = await apiGet(Constants.Endpoints.MESSAGES(channelId), before ? { limit: 100, before } : { limit: 100 });
+        const body = await apiGet(messagesPath(channelId), before ? { limit: 100, before } : { limit: 100 });
         return Array.isArray(body) ? body : [];
     } catch (e: any) {
         if (e?.status === 403) throw new ApiError("No permission to read message history in this channel.", 403);
@@ -289,10 +281,22 @@ async function fetchPage(channelId: string, before?: string): Promise<any[]> {
 
 const delay = () => sleep(Math.max(0, settings.store.delayMs));
 
-/** how far back to read: the oldest message id allowed (since last export), and whether "Max messages" applies */
+/** how far back to read: the oldest message id allowed (since last export), whether "Max messages" applies, and which messages to keep */
 interface FetchLimits {
     minId?: string;
     noLimit?: boolean;
+    /** keep only messages with links (links-only exports) */
+    onlyLinks?: boolean;
+}
+
+/** what an export keeps of the messages it reads: one person's, and/or only the ones with links */
+function keeper(author: { id: string; } | undefined, onlyLinks?: boolean) {
+    return (m: any) => (!author || m.author?.id === author.id) && (!onlyLinks || messageLinks(m).length > 0);
+}
+
+/** "12 from bob", "12 with links", "12 with links from bob", "12" */
+function keptText(n: number, author?: { name: string; }, onlyLinks?: boolean) {
+    return `${n.toLocaleString()}${onlyLinks ? " with links" : ""}${author ? ` from ${author.name}` : ""}`;
 }
 
 async function fetchAll(channelId: string, state: ExportState, range: DateRange = {}, author?: { id: string; name: string; }, limits: FetchLimits = {}) {
@@ -308,6 +312,8 @@ async function fetchAll(channelId: string, state: ExportState, range: DateRange 
     let nextReport = every;
     /** false once the start of the chat (or the "from" date) was reached */
     let more = true;
+    const keep = keeper(author, limits.onlyLinks);
+    const filtered = !!author || !!limits.onlyLinks;
 
     while (!state.cancelled && all.length < max) {
         const page = await fetchPage(channelId, before);
@@ -323,14 +329,14 @@ async function fetchAll(channelId: string, state: ExportState, range: DateRange 
             }
             state.scanned++;
             state.newestId ??= m.id; // pages are newest first
-            // Discord can't filter by person, so every message is read and only theirs are kept
-            if (!author || m.author?.id === author.id) all.push(m);
+            // Discord can't filter by person (or links), so every message is read and only the wanted ones are kept
+            if (keep(m)) all.push(m);
         }
         state.count = all.length;
         before = page[page.length - 1].id;
 
-        if (state.scanned >= nextReport && progressToast(author
-            ? `Exporting... checked ${state.scanned.toLocaleString()} messages, ${all.length.toLocaleString()} from ${author.name} so far`
+        if (state.scanned >= nextReport && progressToast(filtered
+            ? `Exporting... checked ${state.scanned.toLocaleString()} messages, ${keptText(all.length, author, limits.onlyLinks)} so far`
             : `Exporting... ${all.length.toLocaleString()} messages so far`))
             nextReport = state.scanned + every;
         if (reachedStart || page.length < 100) {
@@ -409,14 +415,6 @@ function cmpId(a: string, b: string) {
     return a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
 }
 
-function canRead(channel: any) {
-    try {
-        return PermissionStore.can(PermissionsBits.VIEW_CHANNEL, channel) && PermissionStore.can(PermissionsBits.READ_MESSAGE_HISTORY, channel);
-    } catch {
-        return false;
-    }
-}
-
 /** newest message id Discord has for a channel; null = it never had messages, undefined = unknown */
 function lastIdOf(c: any): string | null | undefined {
     if (c?.lastMessageId !== undefined) return c.lastMessageId;
@@ -430,18 +428,21 @@ function lastIdOf(c: any): string | null | undefined {
  * active and joined; old private threads are not.
  */
 async function findServerTargets(guildId: string, state: ExportState, range: DateRange): Promise<{ targets: Target[]; summary: SearchSummary; }> {
-    const guildName = GuildStore.getGuild(guildId)?.name ?? "Unknown server";
+    const guildName = getGuild(guildId)?.name ?? "Unknown server";
     const summary: SearchSummary = { guildId, guildName, searched: [], noAccess: 0, failed: [], threadNotes: [] };
-    const channels = Object.values(ChannelStore.getMutableGuildChannelsForGuild(guildId) ?? {}) as any[];
+    const channels = guildChannels(guildId);
+    if (!channels)
+        throw new MissingPartError("ChatExporter can't read the server's channel list on this Vencord/Discord version, so \"all channels\" doesn't work until the plugin is updated. Exporting one channel at a time still works.");
 
     const readable: any[] = [];
     for (const c of channels) {
         if (!MESSAGE_TYPES.has(c.type) && !THREAD_PARENT_TYPES.has(c.type)) continue; // categories, directories...
-        if (canRead(c)) readable.push(c);
+        // can't tell (Discord's permission check changed): try it, a "no permission" answer is reported per channel
+        if (canRead(c) !== false) readable.push(c);
         else summary.noAccess++;
     }
     // like the channel list: no category first, then by category; text above voice; then by position
-    const categoryPos = (c: any) => c.parent_id ? (ChannelStore.getChannel(c.parent_id)?.position ?? 0) + 1 : 0;
+    const categoryPos = (c: any) => c.parent_id ? (getChannel(c.parent_id)?.position ?? 0) + 1 : 0;
     readable.sort((a, b) => categoryPos(a) - categoryPos(b)
         || Number(VOICE_TYPES.has(a.type)) - Number(VOICE_TYPES.has(b.type))
         || (a.position ?? 0) - (b.position ?? 0)
@@ -460,7 +461,7 @@ async function findServerTargets(guildId: string, state: ExportState, range: Dat
 
     // 1. threads Discord's app already knows (active ones, and private ones you're in)
     for (const c of readable)
-        for (const t of safeList(() => ChannelStore.getAllThreadsForParent(c.id))) {
+        for (const t of loadedThreads(c.id)) {
             addThread(t);
             joined.add(t.id);
         }
@@ -528,14 +529,6 @@ async function findServerTargets(guildId: string, state: ExportState, range: Dat
     return { targets, summary };
 }
 
-function safeList<T>(get: () => T[] | undefined | null): T[] {
-    try {
-        return get() ?? [];
-    } catch {
-        return [];
-    }
-}
-
 interface Cursor {
     target: Target;
     /** the oldest message id this channel may give (null = from the very start) */
@@ -571,6 +564,7 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
         return baseMin && cmpId(baseMin, after) > 0 ? baseMin : after;
     };
     state.newestByTarget = new Map();
+    const keep = keeper(author, limits.onlyLinks);
     const TOP = "99999999999999999999";
     const min = (a: string, b: string) => cmpId(a, b) <= 0 ? a : b;
     summary.searched = targets;
@@ -661,8 +655,8 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
             state.scanned++;
             // the first one taken from a channel is its newest
             if (!state.newestByTarget.has(c.target.id)) state.newestByTarget.set(c.target.id, m.id);
-            // Discord can't filter by person, so every message is read and only theirs are kept
-            if (!author || m.author?.id === author.id) {
+            // Discord can't filter by person (or links), so every message is read and only the wanted ones are kept
+            if (keep(m)) {
                 if (!kept.has(c.target.id)) kept.set(c.target.id, []);
                 kept.get(c.target.id)!.push(m);
                 state.count++;
@@ -671,7 +665,7 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
         if (c.buf.length || !c.done) push(c);
         else state.channelsDone++;
 
-        if (state.scanned >= nextReport && progressToast(`Exporting all channels... checked ${state.scanned.toLocaleString()} messages, ${author ? `${state.count.toLocaleString()} from ${author.name}` : `kept ${state.count.toLocaleString()}`} so far (${state.channelsDone} of ${state.channelsTotal} channels done)`))
+        if (state.scanned >= nextReport && progressToast(`Exporting all channels... checked ${state.scanned.toLocaleString()} messages, ${author || limits.onlyLinks ? keptText(state.count, author, limits.onlyLinks) : `kept ${state.count.toLocaleString()}`} so far (${state.channelsDone} of ${state.channelsTotal} channels done)`))
             nextReport = state.scanned + every;
     }
     // the limit cut it short while channels still had older messages
@@ -689,12 +683,12 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
 // ---------- helpers ----------
 function channelTitle(channel: Channel) {
     if (channel.guild_id) {
-        const g = GuildStore.getGuild(channel.guild_id);
+        const g = getGuild(channel.guild_id);
         return `${g?.name ?? "Server"} - ${channel.name}`;
     }
     if (channel.name) return channel.name;
     const recips = (channel.recipients ?? []).map(id => {
-        const u = UserStore.getUser(id);
+        const u = getUser(id);
         return u?.globalName ?? u?.username ?? id;
     });
     return recips.length ? `DM - ${recips.join(", ")}` : "DM";
@@ -771,17 +765,17 @@ function renderMarkdown(text: string, msg: any, guildId?: string) {
     // user mentions
     s = s.replace(/&lt;@!?(\d+)&gt;/g, (_, id) => {
         const m = msg.mentions?.find((u: any) => u.id === id);
-        const u = m ?? UserStore.getUser(id);
+        const u = m ?? getUser(id);
         return `<span class="mention">@${esc(u ? displayName(u) : id)}</span>`;
     });
     // role mentions
     s = s.replace(/&lt;@&amp;(\d+)&gt;/g, (_, id) => {
-        const r = guildId ? GuildRoleStore.getRole?.(guildId, id) : null;
+        const r = guildId ? getRole(guildId, id) : null;
         return `<span class="mention">@${esc(r?.name ?? "role")}</span>`;
     });
     // channel mentions
     s = s.replace(/&lt;#(\d+)&gt;/g, (_, id) => {
-        const c = ChannelStore.getChannel(id);
+        const c = getChannel(id);
         return `<span class="mention">#${esc(c?.name ?? id)}</span>`;
     });
     // timestamps
@@ -1034,7 +1028,7 @@ function fullName(u: any) {
 
 function recipientNames(channel: Channel) {
     return (channel.recipients ?? []).map(id => {
-        const u = UserStore.getUser(id);
+        const u = getUser(id);
         return u ? (u.globalName || u.username) : id;
     }).join(", ");
 }
@@ -1042,7 +1036,7 @@ function recipientNames(channel: Channel) {
 /** "My Server", or "Direct Messages" for DMs / group DMs */
 function guildLabel(channel: Channel) {
     if (!channel.guild_id) return "Direct Messages";
-    return GuildStore.getGuild(channel.guild_id)?.name ?? "Unknown server";
+    return getGuild(channel.guild_id)?.name ?? "Unknown server";
 }
 
 /** just the channel's own name: "general", "SomeFriend", thread name, ... */
@@ -1054,7 +1048,7 @@ function plainChannelName(channel: Channel) {
 /** "📢・announcements / some thread" (parent / name) */
 function hierarchicalChannelName(channel: Channel) {
     const own = plainChannelName(channel);
-    const parent = channel.parent_id ? ChannelStore.getChannel(channel.parent_id) : null;
+    const parent = getChannel(channel.parent_id);
     return parent?.name ? `${parent.name} / ${own}` : own;
 }
 
@@ -1183,17 +1177,143 @@ function txtMessage(m: any, savedAs?: Map<string, string>) {
     return b + "\n";
 }
 
-/** "[ChatExporter] SomeFriend_DirectMessages_20260923_155500" (same pattern as DiscordKit), "..._from someuser_..." when filtered */
-function exportFileBase(channel: Channel, author?: { name: string; }) {
+// ---------- links only ----------
+const linkCache = new WeakMap<object, string[]>();
+
+/** a message's links (worked out once per message) */
+function messageLinks(m: any): string[] {
+    let links = linkCache.get(m);
+    if (!links) linkCache.set(m, links = linksIn(m));
+    return links;
+}
+
+/** opens the message in Discord */
+const jumpUrl = (guildId: string | null | undefined, channelId: string, messageId: string) =>
+    `https://discord.com/channels/${guildId ?? "@me"}/${channelId}/${messageId}`;
+
+/** how many links, and the different ones in the order they were first posted */
+function linkStats(messages: any[]) {
+    const unique = new Set<string>();
+    let total = 0;
+    for (const m of messages)
+        for (const url of messageLinks(m)) {
+            total++;
+            unique.add(url);
+        }
+    return { total, unique: [...unique] };
+}
+
+const plural = (n: number, word: string) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+
+/** all channels' messages in the order they were posted (for "the different links, in the order they were first posted") */
+const inPostedOrder = (groups: MessageGroup[]) => groups.flatMap(g => g.messages).sort((a, b) => cmpId(a.id, b.id));
+
+/** "57 links (41 different) in 39 messages" */
+function linksSummary(messages: any[]) {
+    const { total, unique } = linkStats(messages);
+    return `${plural(total, "link")} (${unique.length.toLocaleString()} different) in ${plural(messages.length, "message")}`;
+}
+
+/** one message's links in the text layout: who and when, then one link per line */
+function txtLinks(m: any) {
+    return `[${dkDate(m.timestamp)}] ${fullName(m.author)}\n${messageLinks(m).join("\n")}\n\n`;
+}
+
+/** the end of a links TXT: the totals, then every different link once (easy to copy) */
+function txtLinksEnd(messages: any[], extra: string[] = []) {
+    const { unique } = linkStats(messages);
+    return `${RULE}\n${extra.map(l => l + "\n").join("")}${linksSummary(messages)}. All the different ones:\n${unique.join("\n")}\n${RULE}\n`;
+}
+
+function txtLinksHeader(info: ExportInfo, lines: string[]) {
+    const { range, author } = info;
+    const out = [`${RULE}\n`, ...lines.map(l => l + "\n")];
+    if (range.after) out.push(`After: ${dkDate(range.after)}\n`);
+    if (range.before) out.push(`Before: ${dkDate(range.before)}\n`);
+    if (author) out.push(`Only messages from: ${author.name}\n`);
+    out.push("Only links: the links people posted (uploaded files aren't included)\n", `${RULE}\n\n`);
+    return out;
+}
+
+function buildLinksTxt(channel: Channel, messages: any[], info: ExportInfo) {
+    const out = txtLinksHeader(info, [`Guild: ${guildLabel(channel)}`, `Channel: ${hierarchicalChannelName(channel)}`]);
+    for (const m of messages) out.push(txtLinks(m));
+    out.push(txtLinksEnd(messages));
+    return out;
+}
+
+function buildLinksTxtAll(summary: SearchSummary, groups: MessageGroup[], info: ExportInfo) {
+    const out = txtLinksHeader(info, [`Guild: ${summary.guildName}`, `Channels: all channels and threads you can read (${summary.searched.length} searched, ${groups.length} with links)`]);
+    for (const g of groups) {
+        out.push(`${RULE}\nChannel: ${g.target.name} (${linksSummary(g.messages)})\n${RULE}\n\n`);
+        for (const m of g.messages) out.push(txtLinks(m));
+    }
+    const empty = emptyTargets(summary, groups);
+    const extra = empty.length ? [`Also searched, no links found: ${empty.map(t => `#${t.name}`).join(", ")}`] : [];
+    out.push(txtLinksEnd(inPostedOrder(groups), [...extra, ...skippedLines(summary)]));
+    return out;
+}
+
+/** one message's links as a Discord-looking message: who, when, a jump link, then the links */
+function htmlLinks(messages: any[], guildId: string | null | undefined, channelId: string) {
+    return messages.map(m => `<div class="msg first" id="m${m.id}"><img class="av" src="${esc(avatarUrl(m.author))}" loading="lazy" alt=""><div class="body">`
+        + `<span class="name">${esc(displayName(m.author))}</span><span class="time">${esc(fmtDate(m.timestamp))} · <a href="${esc(jumpUrl(guildId, channelId, m.id))}">jump to message</a></span>`
+        + `<div class="content">${messageLinks(m).map(u => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`).join("<br>")}</div></div></div>`);
+}
+
+/** every different link once, folded away at the top */
+function htmlUniqueLinks(messages: any[]) {
+    const { unique } = linkStats(messages);
+    return `<section class="toc"><details><summary>All ${unique.length.toLocaleString()} different links, in the order they were first posted</summary>`
+        + unique.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`).join("<br>") + "</details></section>";
+}
+
+function buildLinksHtml(channel: Channel, messages: any[], info: ExportInfo) {
+    const who = info.author ? ` from ${info.author.name}` : "";
+    const sub = `${linksSummary(messages)}${who}${describeRange(info.range, discordLocale())} · exported ${new Date().toLocaleString()} · channel id ${channel.id}`;
+    return [htmlStart(`${channelTitle(channel)} - links`, sub), htmlUniqueLinks(messages), ...htmlLinks(messages, channel.guild_id, channel.id), HTML_END];
+}
+
+function buildLinksHtmlAll(summary: SearchSummary, groups: MessageGroup[], info: ExportInfo) {
+    const all = inPostedOrder(groups);
+    const who = info.author ? ` from ${info.author.name}` : "";
+    const sub = `${linksSummary(all)}${who} in ${groups.length} of ${summary.searched.length} channels and threads${describeRange(info.range, discordLocale())} · exported ${new Date().toLocaleString()} · server id ${summary.guildId}`;
+    const parts = [htmlStart(`${summary.guildName} - links, all channels`, sub), htmlUniqueLinks(all)];
+    let toc = "<section class=\"toc\"><b>Channels with links</b><br>";
+    toc += groups.map(g => `<a href="#c${g.target.id}">#${esc(g.target.name)}</a> <span class="time">(${linkStats(g.messages).total.toLocaleString()})</span>`).join(" · ");
+    for (const line of skippedLines(summary)) toc += `<div class="time">${esc(line)}</div>`;
+    parts.push(toc + "</section>");
+    for (const g of groups) {
+        parts.push(`<h2 class="chan" id="c${g.target.id}">#${esc(g.target.name)} <span>${esc(linksSummary(g.messages))}</span></h2>`);
+        parts.push(...htmlLinks(g.messages, summary.guildId, g.target.id));
+    }
+    parts.push(HTML_END);
+    return parts;
+}
+
+/** links as JSON: one entry per link, with who posted it, when, and where */
+function jsonLinks(messages: any[], guildId: string | null | undefined, channelId: string, channelName?: string) {
+    return messages.flatMap(m => messageLinks(m).map(url => ({
+        url,
+        ...(channelName !== undefined ? { channelId, channel: channelName } : {}),
+        author: { id: m.author?.id ?? null, username: m.author?.username ?? null },
+        timestamp: m.timestamp,
+        messageId: m.id,
+        jumpUrl: jumpUrl(guildId, channelId, m.id)
+    })));
+}
+
+/** "[ChatExporter] SomeFriend_DirectMessages_20260923_155500" (same pattern as DiscordKit), "..._from someuser_..." when filtered, "..._links_..." for links only */
+function exportFileBase(channel: Channel, author?: { name: string; }, links = false) {
     const guild = channel.guild_id ? guildLabel(channel) : "DirectMessages";
     const who = author ? `_from ${author.name}` : "";
-    return safeFileName(`[ChatExporter] ${plainChannelName(channel)}_${guild}${who}_${fileStamp()}`);
+    return safeFileName(`[ChatExporter] ${plainChannelName(channel)}_${guild}${who}${links ? "_links" : ""}_${fileStamp()}`);
 }
 
 /** "[ChatExporter] All channels_My Server_from someuser_20260924_224500" */
-function serverFileBase(guildName: string, author?: { name: string; }) {
+function serverFileBase(guildName: string, author?: { name: string; }, links = false) {
     const who = author ? `_from ${author.name}` : "";
-    return safeFileName(`[ChatExporter] All channels_${guildName}${who}_${fileStamp()}`);
+    return safeFileName(`[ChatExporter] All channels_${guildName}${who}${links ? "_links" : ""}_${fileStamp()}`);
 }
 
 /** "20260923_155500" */
@@ -1367,12 +1487,12 @@ async function save(parts: string[], filename: string, mime: string, openFolder:
 
     // fallbacks for builds without the desktop part
     const discordNative = (window as any).DiscordNative;
-    if (IS_DISCORD_DESKTOP && discordNative?.fileManager?.saveWithDialog) {
+    if (isDesktopApp() && discordNative?.fileManager?.saveWithDialog) {
         // Discord's own Save window only accepts plain names: letters, numbers, - _ .
         await discordNative.fileManager.saveWithDialog(new Uint8Array(await blob.arrayBuffer()), filename.replace(/[^A-Za-z0-9._-]+/g, "_"));
         return { shownAs: "the folder you picked in the Save window" };
     }
-    saveFile(new File([blob], filename, { type: mime }));
+    browserDownload(new File([blob], filename, { type: mime }));
     return { shownAs: "your browser's downloads" };
 }
 
@@ -1392,6 +1512,8 @@ interface ExportOptions {
     since?: ExportMark;
     /** that earlier export only had this person's messages (this one is for everyone or someone else) */
     sinceOnlyFrom?: string;
+    /** just the links people posted: reads everything ("Max messages" doesn't apply), no files zip */
+    links?: boolean;
 }
 
 /** keeps free space for the zip on top of the files themselves */
@@ -1403,7 +1525,7 @@ const newState = (): ExportState => ({ cancelled: false, count: 0, scanned: 0, p
 function reporter(opts: ExportOptions, fallbackChannelId?: string) {
     const to = opts.reportTo ?? fallbackChannelId;
     return (content: string) => {
-        if (opts.fromCommand && to) sendBotMessage(to, { content });
+        if (opts.fromCommand && to) botMessage(to, content);
     };
 }
 
@@ -1458,10 +1580,15 @@ async function saveEverything(state: ExportState, opts: ExportOptions, report: (
     return saved;
 }
 
+const UPDATE_HINT = "This usually means a Vencord or Discord update changed something ChatExporter uses, so the plugin needs an update (github.com/Adamko-10/vencord-chat-exporter).";
+
 async function exportFailed(e: any, state: ExportState, report: (s: string) => void) {
     console.error("[ChatExporter]", e);
-    toast(`Export failed: ${e?.message ?? e}`, "failure");
-    report(`Export failed: ${e?.message ?? e}`);
+    const why = e instanceof MissingPartError ? e.message
+        : isBroken(e) ? `${e.message}. ${UPDATE_HINT}`
+            : e?.message ?? String(e);
+    toast(`Export failed: ${why}`, "failure");
+    report(`Export failed: ${why}`);
     const native = getNative();
     if (state.zipId && native) {
         // don't leave a half-written zip open
@@ -1473,28 +1600,30 @@ async function exportFailed(e: any, state: ExportState, report: (s: string) => v
 async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
     if (running.has(channel.id)) return;
     const range = opts.range ?? {};
-    const { author } = opts;
+    const { author, since, links = false } = opts;
     const state = newState();
     running.set(channel.id, state);
     const startedAt = Date.now();
-    const { since } = opts;
     const who = author ? ` (only messages from ${author.name})` : "";
     const what = since ? ` since ${lastExport(opts)}` : describeRange(range, discordLocale());
-    noteToast(`Starting export of ${channelTitle(channel)}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the chat again"} to cancel)`);
+    noteToast(`Starting export of ${links ? "the links in " : ""}${channelTitle(channel)}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the chat again"} to cancel)`);
     const report = reporter(opts, channel.id);
 
     try {
-        const messages = await fetchAll(channel.id, state, range, author, since ? { minId: nextId(since.upToId), noLimit: true } : {});
+        // links only: every message is read ("Max messages" doesn't apply), the ones with links are kept
+        const messages = await fetchAll(channel.id, state, range, author, { minId: since && nextId(since.upToId), noLimit: !!since || links, onlyLinks: links });
         // someone Discord hadn't loaded yet (left the server...) only had their id so far
         if (author && author.name === author.id && messages[0]?.author?.username) author.name = messages[0].author.username;
         if (!messages.length) {
             const where = range.after || range.before ? " in that date range" : "";
+            const from = author ? ` from ${author.name}` : "";
             const why = state.cancelled ? "Export cancelled before any messages were found, nothing was saved."
-                : since ? `Nothing new${author ? ` from ${author.name}` : ""} since ${lastExport(opts)}.`
-                    : author ? `No messages from ${author.name}${where} (looked through ${state.scanned.toLocaleString()}).`
-                        : where ? "No messages in that date range." : "No messages found to export.";
-            // "nothing new" is good news, not an error
-            toast(why, since && !state.cancelled ? "message" : "failure");
+                : links ? (since ? `No new links${from} since ${lastExport(opts)}.` : `No links${from}${where || " in this chat"} (looked through ${plural(state.scanned, "message")}).`)
+                    : since ? `Nothing new${from} since ${lastExport(opts)}.`
+                        : author ? `No messages from ${author.name}${where} (looked through ${state.scanned.toLocaleString()}).`
+                            : where ? "No messages in that date range." : "No messages found to export.";
+            // "nothing new" / "no links" is an answer, not an error
+            toast(why, (since || links) && !state.cancelled ? "message" : "failure");
             report(why);
             return;
         }
@@ -1502,8 +1631,30 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
             noteToast(capNote(messages.length));
             report(capNote(messages.length));
         }
-        const savedWhat = `${messages.length.toLocaleString()}${since ? " new" : ""} message${messages.length === 1 ? "" : "s"}`;
-        const saved = await saveEverything(state, opts, report, messages, exportFileBase(channel, author), savedWhat, (fmt, info) => {
+        const { total, unique } = links ? linkStats(messages) : { total: 0, unique: [] };
+        const savedWhat = links
+            ? `${plural(total, since ? "new link" : "link")} from ${plural(messages.length, "message")}`
+            : `${messages.length.toLocaleString()}${since ? " new" : ""} message${messages.length === 1 ? "" : "s"}`;
+        // a links export is just the list: no files zip
+        const saved = await saveEverything(state, links ? { ...opts, files: false } : opts, report, messages, exportFileBase(channel, author, links), savedWhat, (fmt, info) => {
+            if (links) {
+                if (fmt === "json") {
+                    const json = JSON.stringify({
+                        channel: { id: channel.id, name: channelTitle(channel), guild_id: channel.guild_id ?? null, type: channel.type },
+                        exportedAt: new Date().toISOString(),
+                        range: { after: range.after?.toISOString() ?? null, before: range.before?.toISOString() ?? null },
+                        onlyFrom: author ? { id: author.id, username: author.name } : null,
+                        onlyLinks: true,
+                        messagesWithLinks: messages.length,
+                        linkCount: total,
+                        differentLinks: unique,
+                        links: jsonLinks(messages, channel.guild_id, channel.id)
+                    }, null, 2);
+                    return { parts: [json], ext: ".json", mime: "application/json" };
+                }
+                if (fmt === "txt") return { parts: buildLinksTxt(channel, messages, info), ext: ".txt", mime: "text/plain" };
+                return { parts: buildLinksHtml(channel, messages, info), ext: ".html", mime: "text/html" };
+            }
             if (fmt === "json") {
                 const json = JSON.stringify({
                     channel: { id: channel.id, name: channelTitle(channel), guild_id: channel.guild_id ?? null, type: channel.type },
@@ -1520,7 +1671,7 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
         });
         // the next "since last export" carries on right after the newest message looked at
         if (saved && state.newestId)
-            await rememberExport(markKey(channel.id, author), { upToId: state.newestId, at: startedAt, file: saved.shownAs, count: messages.length, name: author?.name });
+            await rememberExport(markKey(channel.id, author, links), { upToId: state.newestId, at: startedAt, file: saved.shownAs, count: messages.length, name: author?.name });
     } catch (e: any) {
         await exportFailed(e, state, report);
     } finally {
@@ -1533,15 +1684,14 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
     const key = guildKey(guildId);
     if (running.has(key)) return;
     const range = opts.range ?? {};
-    const { author } = opts;
+    const { author, since, links = false } = opts;
     const state = newState();
     running.set(key, state);
     const startedAt = Date.now();
-    const { since } = opts;
-    const guildName = GuildStore.getGuild(guildId)?.name ?? "this server";
+    const guildName = getGuild(guildId)?.name ?? "this server";
     const who = author ? ` (only messages from ${author.name})` : "";
     const what = since ? ` since ${lastExport(opts, "all-channels ")}` : describeRange(range, discordLocale());
-    noteToast(`Starting export of all channels in ${guildName}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the server again"} to cancel)`);
+    noteToast(`Starting export of ${links ? "the links in " : ""}all channels in ${guildName}${who}${what}... (${opts.fromCommand ? "run /exportchat again" : "right-click the server again"} to cancel)`);
     const report = reporter(opts);
 
     try {
@@ -1549,30 +1699,60 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
         if (!state.cancelled)
             report(`Going through ${targets.length.toLocaleString()} channels and threads${summary.noAccess ? ` (skipping ${summary.noAccess} you can't open)` : ""}...`);
         const groups = await fetchMany(targets, state, summary, range, author,
-            since ? { minId: nextId(since.upToId), perTarget: since.channels, noLimit: true } : {});
+            { minId: since && nextId(since.upToId), perTarget: since?.channels, noLimit: !!since || links, onlyLinks: links });
         const messages = groups.flatMap(g => g.messages);
         if (author && author.name === author.id && messages[0]?.author?.username) author.name = messages[0].author.username;
         if (state.hitCap) summary.capped = messages.length;
         const notes = skippedLines(summary);
         const inRange = range.after || range.before ? " in that date range" : "";
+        const searched = `${summary.searched.length.toLocaleString()} channels and threads`;
+        const from = author ? ` from ${author.name}` : "";
 
         if (!messages.length) {
             const why = state.cancelled ? "Export cancelled before any messages were found, nothing was saved."
-                : since ? `Nothing new${author ? ` from ${author.name}` : ""} in any of the ${summary.searched.length.toLocaleString()} channels and threads since ${lastExport(opts, "all-channels ")}.`
-                    : author ? `No messages from ${author.name}${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads (looked through ${state.scanned.toLocaleString()}).`
-                        : `No messages${inRange} in any of the ${summary.searched.length.toLocaleString()} channels and threads.`;
-            toast(why, since && !state.cancelled ? "message" : "failure");
+                : links ? `No ${since ? "new " : ""}links${from} in any of the ${searched}${since ? ` since ${lastExport(opts, "all-channels ")}` : inRange}${since ? "" : ` (looked through ${plural(state.scanned, "message")})`}.`
+                    : since ? `Nothing new${from} in any of the ${searched} since ${lastExport(opts, "all-channels ")}.`
+                        : author ? `No messages from ${author.name}${inRange} in any of the ${searched} (looked through ${state.scanned.toLocaleString()}).`
+                            : `No messages${inRange} in any of the ${searched}.`;
+            toast(why, (since || links) && !state.cancelled ? "message" : "failure");
             report(state.cancelled ? why : [why, ...notes].join(" "));
             return;
         }
         // say what was searched, so it's clear what "all channels" covered
-        const newWhen = since ? " since your last export" : inRange;
-        report([`Searched ${summary.searched.length.toLocaleString()} channels and threads, ${groups.length} had ${since ? "new " : ""}${author ? `messages from ${author.name}` : "messages"}${newWhen}.`, ...notes].join(" "));
+        const newWhen = since ? ` since your last ${links ? "links " : ""}export` : inRange;
+        const had = links ? `links${from}` : author ? `messages from ${author.name}` : "messages";
+        report([`Searched ${searched}, ${groups.length} had ${since ? "new " : ""}${had}${newWhen}.`, ...notes].join(" "));
         if (state.hitCap) noteToast(capNote(messages.length));
 
         const n = messages.length;
-        const savedWhat = `${n.toLocaleString()}${since ? " new" : ""} message${n === 1 ? "" : "s"} from ${groups.length} channel${groups.length === 1 ? "" : "s"}`;
-        const saved = await saveEverything(state, opts, report, messages, serverFileBase(summary.guildName, author), savedWhat, (fmt, info) => {
+        const { total, unique } = links ? linkStats(inPostedOrder(groups)) : { total: 0, unique: [] };
+        const inChannels = `from ${plural(groups.length, "channel")}`;
+        const savedWhat = links
+            ? `${plural(total, since ? "new link" : "link")} ${inChannels}`
+            : `${n.toLocaleString()}${since ? " new" : ""} message${n === 1 ? "" : "s"} ${inChannels}`;
+        // a links export is just the list: no files zip
+        const saved = await saveEverything(state, links ? { ...opts, files: false } : opts, report, messages, serverFileBase(summary.guildName, author, links), savedWhat, (fmt, info) => {
+            if (links) {
+                if (fmt === "json") {
+                    const json = JSON.stringify({
+                        guild: { id: guildId, name: summary.guildName },
+                        scope: "all channels and threads you can read",
+                        exportedAt: new Date().toISOString(),
+                        range: { after: range.after?.toISOString() ?? null, before: range.before?.toISOString() ?? null },
+                        onlyFrom: author ? { id: author.id, username: author.name } : null,
+                        onlyLinks: true,
+                        channelsSearched: summary.searched.length,
+                        messagesWithLinks: n,
+                        linkCount: total,
+                        differentLinks: unique,
+                        notes,
+                        links: groups.flatMap(g => jsonLinks(g.messages, guildId, g.target.id, g.target.name))
+                    }, null, 2);
+                    return { parts: [json], ext: ".json", mime: "application/json" };
+                }
+                if (fmt === "txt") return { parts: buildLinksTxtAll(summary, groups, info), ext: ".txt", mime: "text/plain" };
+                return { parts: buildLinksHtmlAll(summary, groups, info), ext: ".html", mime: "text/html" };
+            }
             if (fmt === "json") {
                 const json = JSON.stringify({
                     guild: { id: guildId, name: summary.guildName },
@@ -1605,7 +1785,7 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
             const upToId = prevId(dateToSnowflake(new Date(until)));
             const channels: Record<string, string> = {};
             for (const [id, newest] of state.newestByTarget ?? []) if (cmpId(newest, upToId) > 0) channels[id] = newest;
-            await rememberExport(markKey(key, author), { upToId, channels, at: startedAt, file: saved.shownAs, count: n, name: author?.name });
+            await rememberExport(markKey(key, author, links), { upToId, channels, at: startedAt, file: saved.shownAs, count: n, name: author?.name });
         }
     } catch (e: any) {
         await exportFailed(e, state, report);
@@ -1621,13 +1801,15 @@ function cancelLabel(state: ExportState) {
     return `Cancel export (${state.count.toLocaleString()} fetched${channels})`;
 }
 
+type MenuParts = NonNullable<ReturnType<typeof menuParts>>;
+
 /** "Export Chat", plus "Export New Messages" once this chat was exported before (or "Cancel export" while one runs) */
-function makeItems(channel?: Channel) {
+function makeItems(M: MenuParts, channel?: Channel) {
     if (!channel) return [];
     const state = running.get(channel.id);
     if (state)
         return [
-            <Menu.MenuItem
+            <M.MenuItem
                 key="vc-chat-export"
                 id="vc-chat-export"
                 label={cancelLabel(state)}
@@ -1636,7 +1818,7 @@ function makeItems(channel?: Channel) {
             />
         ];
     const items = [
-        <Menu.MenuItem
+        <M.MenuItem
             key="vc-chat-export"
             id="vc-chat-export"
             label="Export Chat"
@@ -1646,7 +1828,7 @@ function makeItems(channel?: Channel) {
     const found = findMark(channel.id);
     if (found)
         items.push(
-            <Menu.MenuItem
+            <M.MenuItem
                 key="vc-chat-export-new"
                 id="vc-chat-export-new"
                 label={`Export New Messages (since ${shortWhen(found.mark.at)})`}
@@ -1656,36 +1838,39 @@ function makeItems(channel?: Channel) {
     return items;
 }
 
+// if Discord's menu parts changed, the items are just left out (/exportchat still works)
 const channelPatch: NavContextMenuPatchCallback = (children, { channel }: { channel?: Channel; }) => {
-    const items = makeItems(channel);
-    if (items.length) children.push(<Menu.MenuSeparator />, ...items);
+    const M = menuParts();
+    if (!M) return;
+    const items = makeItems(M, channel);
+    if (items.length) children.push(<M.MenuSeparator />, ...items);
 };
 
 const userPatch: NavContextMenuPatchCallback = (children, { user, channel }: { user?: User; channel?: Channel; }) => {
+    const M = menuParts();
+    if (!M) return;
     // Only for DMs: use the DM channel with that user
     let dm = channel && !channel.guild_id && channel.type === 1 ? channel : undefined;
-    if (!dm && user) {
-        const id = ChannelStore.getDMFromUserId(user.id);
-        if (id) dm = ChannelStore.getChannel(id);
-    }
+    if (!dm && user) dm = getChannel(dmChannelId(user.id));
     if (!dm) return;
-    const items = makeItems(dm);
-    if (items.length) children.push(<Menu.MenuSeparator />, ...items);
+    const items = makeItems(M, dm);
+    if (items.length) children.push(<M.MenuSeparator />, ...items);
 };
 
 const guildPatch: NavContextMenuPatchCallback = (children, { guild }: { guild?: { id: string; }; }) => {
-    if (!guild?.id) return;
+    const M = menuParts();
+    if (!M || !guild?.id) return;
     const key = guildKey(guild.id);
     const state = running.get(key);
     if (state) {
-        children.push(<Menu.MenuSeparator />, <Menu.MenuItem id="vc-chat-export-server" label={cancelLabel(state)} color="danger" action={() => cancelExport(state)} />);
+        children.push(<M.MenuSeparator />, <M.MenuItem id="vc-chat-export-server" label={cancelLabel(state)} color="danger" action={() => cancelExport(state)} />);
         return;
     }
-    children.push(<Menu.MenuSeparator />, <Menu.MenuItem id="vc-chat-export-server" label="Export All Channels" action={() => exportServer(guild.id, {})} />);
+    children.push(<M.MenuSeparator />, <M.MenuItem id="vc-chat-export-server" label="Export All Channels" action={() => exportServer(guild.id, {})} />);
     const found = findMark(key);
     if (found)
         children.push(
-            <Menu.MenuItem
+            <M.MenuItem
                 id="vc-chat-export-server-new"
                 label={`Export New Messages, All Channels (since ${shortWhen(found.mark.at)})`}
                 action={() => exportServer(guild.id, newSince(found))}
@@ -1695,7 +1880,7 @@ const guildPatch: NavContextMenuPatchCallback = (children, { guild }: { guild?: 
 
 export default definePlugin({
     name: "ChatExporter",
-    description: "Export the full history of any channel, DM, group DM or thread, or every channel of a server, to TXT/HTML/JSON, no message limit, plus a .zip of the files people sent. Right-click a chat → Export Chat, right-click a server → Export All Channels, or type /exportchat (dates, one person, all channels, or just what's new since your last export). Saved to your Downloads folder.",
+    description: "Export the full history of any channel, DM, group DM or thread, or every channel of a server, to TXT/HTML/JSON, no message limit, plus a .zip of the files people sent. Right-click a chat → Export Chat, right-click a server → Export All Channels, or type /exportchat (dates, one person, all channels, just the links, or just what's new since your last export). Saved to your Downloads folder.",
     authors: [{ name: "Adamko-10", id: 0n }, { name: "Claude", id: 0n }],
     // on automatically after a (re)build, so it never silently sits disabled
     enabledByDefault: true,
@@ -1705,36 +1890,36 @@ export default definePlugin({
         {
             name: "exportchat",
             description: "Export this chat, or every channel of this server. Run again to cancel a running export.",
-            inputType: ApplicationCommandInputType.BUILT_IN,
+            inputType: BUILT_IN_COMMAND,
             options: [
                 {
                     name: "from",
                     description: "Start, e.g. 2026-09-15, 15.09.2026, 15 sep, yesterday, 7d (7 days ago). Empty = first message",
-                    type: ApplicationCommandOptionType.STRING,
+                    type: OptionKind.STRING,
                     required: false
                 },
                 {
                     name: "to",
                     description: "End, that whole day included, e.g. 2026-09-22, 22.09, today. Empty = now",
-                    type: ApplicationCommandOptionType.STRING,
+                    type: OptionKind.STRING,
                     required: false
                 },
                 {
                     name: "since_last",
                     description: "True = everything new since your last export of this (all of it, Max messages doesn't apply)",
-                    type: ApplicationCommandOptionType.BOOLEAN,
+                    type: OptionKind.BOOLEAN,
                     required: false
                 },
                 {
                     name: "user",
                     description: "Only this person's messages (empty = everyone)",
-                    type: ApplicationCommandOptionType.USER,
+                    type: OptionKind.USER,
                     required: false
                 },
                 {
                     name: "channels",
                     description: "This channel (default) or every channel and thread in this server you can read",
-                    type: ApplicationCommandOptionType.STRING,
+                    type: OptionKind.STRING,
                     required: false,
                     choices: [
                         { name: "this channel", value: "this", label: "this channel" },
@@ -1742,15 +1927,21 @@ export default definePlugin({
                     ]
                 },
                 {
+                    name: "links",
+                    description: "True = only a list of the links people posted (whole chat, Max messages doesn't apply)",
+                    type: OptionKind.BOOLEAN,
+                    required: false
+                },
+                {
                     name: "files",
                     description: "Download the files people sent into a .zip (default: your plugin setting, normally yes)",
-                    type: ApplicationCommandOptionType.BOOLEAN,
+                    type: OptionKind.BOOLEAN,
                     required: false
                 },
                 {
                     name: "format",
                     description: "txt, html or json (default: your plugin setting, normally txt)",
-                    type: ApplicationCommandOptionType.STRING,
+                    type: OptionKind.STRING,
                     required: false,
                     choices: [
                         { name: "html", value: "html", label: "html" },
@@ -1767,43 +1958,54 @@ export default definePlugin({
                 if (state) {
                     cancelExport(state);
                     const which = state === serverState ? "the all-channels export" : "export";
-                    sendBotMessage(channel.id, {
-                        content: state.phase === "files"
-                            ? `Cancelling: stopping the file downloads (${state.filesDone.toLocaleString()} of ${state.filesTotal.toLocaleString()} done, keeping those)...`
-                            : `Cancelling ${which} (${state.count.toLocaleString()} messages so far, saving those)...`
-                    });
+                    botMessage(channel.id, state.phase === "files"
+                        ? `Cancelling: stopping the file downloads (${state.filesDone.toLocaleString()} of ${state.filesTotal.toLocaleString()} done, keeping those)...`
+                        : `Cancelling ${which} (${state.count.toLocaleString()} messages so far, saving those)...`);
                     return;
                 }
-                const allChannels = findOption<string>(args, "channels", "this") === "all";
+                // what a Vencord or Discord update may have changed: stop if it's essential, otherwise say what's affected
+                const missing = checkParts(!!getNative()).filter(p => !p.ok);
+                const gone = missing.find(p => p.essential);
+                if (gone) {
+                    botMessage(channel.id, `ChatExporter can't export right now: ${gone.what} changed in a Vencord or Discord update, so ${gone.without}. The plugin needs an update (github.com/Adamko-10/vencord-chat-exporter).`);
+                    return;
+                }
+                const headsUp = missing.length ? ` Heads-up, a Vencord or Discord update changed some things ChatExporter uses: ${missing.map(p => p.without).join("; ")}.` : "";
+                const allChannels = option<string>(args, "channels", "this") === "all";
                 if (allChannels && !channel.guild_id) {
-                    sendBotMessage(channel.id, { content: "\"All channels\" only works in a server. A DM or group DM is just this one chat, so leave `channels` empty." });
+                    botMessage(channel.id, "\"All channels\" only works in a server. A DM or group DM is just this one chat, so leave `channels` empty.");
                     return;
                 }
-                const fmt = findOption(args, "format", "") as string;
+                const fmt = option(args, "format", "") as string;
                 const locale = discordLocale();
-                const fromText = String(findOption(args, "from", "") ?? "");
-                const sinceLast = findOption<boolean>(args, "since_last", false) === true;
+                const fromText = String(option(args, "from", "") ?? "");
+                const sinceLast = option<boolean>(args, "since_last", false) === true;
                 if (sinceLast && fromText.trim()) {
-                    sendBotMessage(channel.id, { content: "Use either `from` or `since_last`, not both: since_last already starts right after your last export." });
+                    botMessage(channel.id, "Use either `from` or `since_last`, not both: since_last already starts right after your last export.");
                     return;
                 }
-                const parsed = buildRange(fromText, String(findOption(args, "to", "") ?? ""), new Date(), locale);
+                const parsed = buildRange(fromText, String(option(args, "to", "") ?? ""), new Date(), locale);
                 if ("error" in parsed) {
-                    sendBotMessage(channel.id, { content: parsed.error });
+                    botMessage(channel.id, parsed.error);
                     return;
                 }
-                const userId = String(findOption(args, "user", "") ?? "").replace(/\D/g, "");
-                const author = userId ? { id: userId, name: UserStore.getUser(userId)?.username ?? userId } : undefined;
-                const files = findOption<boolean>(args, "files");
+                const userId = String(option(args, "user", "") ?? "").replace(/\D/g, "");
+                const author = userId ? { id: userId, name: getUser(userId)?.username ?? userId } : undefined;
+                const files = option<boolean>(args, "files");
+                const links = option<boolean>(args, "links", false) === true;
+                if (links && files === true) {
+                    botMessage(channel.id, "`links: True` only saves the list of links, so it doesn't download any files. Leave `files` empty, or do a normal export for the files.");
+                    return;
+                }
 
-                // since_last: carry on right after where the latest export here ended (see findMark)
+                // since_last: carry on right after where the latest export here ended (see findMark); links exports have their own
                 let since: ExportMark | undefined;
                 let sinceOnlyFrom: string | undefined;
                 if (sinceLast) {
                     await loadMarks();
-                    const found = findMark(allChannels ? guildKey(channel.guild_id) : channel.id, author);
+                    const found = findMark(allChannels ? guildKey(channel.guild_id) : channel.id, author, links);
                     if (!found) {
-                        sendBotMessage(channel.id, { content: noMarkMessage(allChannels) });
+                        botMessage(channel.id, noMarkMessage(allChannels, links));
                         return;
                     }
                     since = found.mark;
@@ -1813,26 +2015,31 @@ export default definePlugin({
                 }
 
                 // say how everything was understood, so a misread 3/9 is easy to spot and cancel
-                const who = author ? ` (only messages from ${author.name})` : "";
-                const opts: ExportOptions = { format: fmt, fromCommand: true, reportTo: channel.id, range: parsed.range, author, files: typeof files === "boolean" ? files : undefined, since, sinceOnlyFrom };
+                const who = author ? links ? ` posted by ${author.name}` : ` (only messages from ${author.name})` : "";
+                const opts: ExportOptions = { format: fmt, fromCommand: true, reportTo: channel.id, range: parsed.range, author, files: typeof files === "boolean" ? files : undefined, since, sinceOnlyFrom, links };
                 const max = settings.store.maxMessages;
-                const limit = max && !since ? ` Stops at ${max.toLocaleString()} messages (your "Max messages" setting), keeping the newest.` : "";
+                const limit = !max || since ? ""
+                    : links ? " Every message is read to find the links, so your \"Max messages\" setting doesn't apply."
+                        : ` Stops at ${max.toLocaleString()} messages (your "Max messages" setting), keeping the newest.`;
                 const what = describeRange(parsed.range, locale);
                 // "since your last export (Thu, 24 Sept 2026, 22:38, `Downloads\...html`)", plus whose messages it had if only one other person's
-                const lastOne = since && `since your last ${allChannels ? "all-channels " : ""}export (${niceDate(new Date(since.at), locale)}${since.file ? `, \`${since.file}\`` : ""}`
+                const lastOne = since && `since your last ${allChannels ? "all-channels " : ""}${links ? "links " : ""}export (${niceDate(new Date(since.at), locale)}${since.file ? `, \`${since.file}\`` : ""}`
                     + `${sinceOnlyFrom ? `, which only had ${sinceOnlyFrom}'s messages` : ""})`
                     + (parsed.range.before ? ` up to ${niceDate(new Date(parsed.range.before.getTime() - 1), locale)}` : "");
                 if (allChannels) {
-                    const server = GuildStore.getGuild(channel.guild_id)?.name ?? "this server";
-                    const scopeText = since
-                        ? `everything new in every channel and thread you can read in ${server}${who} ${lastOne}`
-                        : `every channel and thread you can read in ${server}${who}${what}`;
-                    sendBotMessage(channel.id, { content: `Export started: ${scopeText}. Big servers take a while, it has to read each channel.${limit} Run /exportchat again to cancel.` });
+                    const server = getGuild(channel.guild_id)?.name ?? "this server";
+                    const where = `every channel and thread you can read in ${server}${who}`;
+                    const scopeText = links
+                        ? since ? `the new links in ${where} ${lastOne}` : `the links in ${where}${what}`
+                        : since ? `everything new in ${where} ${lastOne}` : `${where}${what}`;
+                    botMessage(channel.id, `Export started: ${scopeText}. Big servers take a while, it has to read each channel.${limit} Run /exportchat again to cancel.${headsUp}`);
                     exportServer(channel.guild_id, opts);
                     return;
                 }
-                const scopeText = since ? `${who}: everything new ${lastOne}` : `${who}${what || (author ? "" : " (the whole chat)")}`;
-                sendBotMessage(channel.id, { content: `Export started${scopeText}.${limit} Run /exportchat again to cancel.` });
+                const scopeText = links
+                    ? `: the ${since ? `new links${who} ${lastOne}` : `links${who}${what || " in the whole chat"}`}`
+                    : since ? `${who}: everything new ${lastOne}` : `${who}${what || (author ? "" : " (the whole chat)")}`;
+                botMessage(channel.id, `Export started${scopeText}.${limit} Run /exportchat again to cancel.${headsUp}`);
                 exportChannel(channel, opts);
             }
         }

@@ -19,7 +19,7 @@ Works in channels, threads, forum posts, DMs and group DMs. Saves as **TXT** (sa
 | `since_last` | `True` = only what's new since your last export of this chat or server (with `user`: since the last export that had their messages). Gets all of it; *Max messages* doesn't apply. |
 | `user` | only this person's messages |
 | `channels` | `all channels in this server` = every channel and thread you can read (text, announcements, voice-channel chats, forum posts, archived threads), in one file with a section per channel |
-| `links` | `True` = only the links people posted: who posted each one and when, then every different link once. Reads the whole chat (*Max messages* doesn't apply), no files zip. Works with `user`, dates, `channels` and `since_last` (links exports remember their own "last export"). |
+| `links` | `True` = only the links people posted: who posted each one and when, then every different link once. Works with every other option: `user`, dates, `channels`, `since_last` (links exports remember their own "last export"), *Max messages* (the newest that many messages with links) and `files: True` (adds a zip of every file people sent). |
 | `files` | `False` = don't download the files |
 | `format` | `txt`, `html` or `json` |
 
@@ -74,6 +74,7 @@ No. Measured with realistic Discord messages in the same JavaScript engine Disco
 - **CPU:** an export mostly waits on Discord (one request per 100 messages plus a deliberate 300 ms pause, so it never spams the API). Building the file at the end takes about 0.25 s for TXT and under 1 s for HTML, even for 100,000 messages.
 - **RAM:** about 1 KB per message while an export runs (10,000 messages ≈ 11 MB, 100,000 ≈ 106 MB). Saving briefly needs a few times the file's size on top: a 100,000-message export peaks around 180 MB as TXT and 260 MB as HTML. It's all freed when the export is done. JSON is the heaviest format for huge chats because it's the raw API data.
 - **Files** are streamed straight to disk in small chunks, so a few GB of attachments still only use a few MB of RAM.
+- **How big can an export be?** There's no limit in the plugin. Discord hands out 100 messages per request, so reading takes about an hour per 700,000 messages. About a million messages per export is fine; far beyond that, Discord itself can run out of memory (export big servers in date ranges or per channel then). JSON is written in pieces, so it isn't stopped by JavaScript's 512 MB limit on one piece of text either.
 
 ## When Vencord or Discord update
 

@@ -287,16 +287,25 @@ interface FetchLimits {
     noLimit?: boolean;
     /** keep only messages with links (links-only exports) */
     onlyLinks?: boolean;
+    /** ...and the ones with files too (links export with files: True, for the zip) */
+    withFiles?: boolean;
 }
 
-/** what an export keeps of the messages it reads: one person's, and/or only the ones with links */
-function keeper(author: { id: string; } | undefined, onlyLinks?: boolean) {
-    return (m: any) => (!author || m.author?.id === author.id) && (!onlyLinks || messageLinks(m).length > 0);
+/** what an export keeps of the messages it reads: one person's, and/or only the ones with links (or files) */
+function keeper(author: { id: string; } | undefined, limits: FetchLimits) {
+    return (m: any) => (!author || m.author?.id === author.id)
+        && (!limits.onlyLinks || messageLinks(m).length > 0 || (!!limits.withFiles && messageFiles(m).length > 0));
 }
+
+/** "messages", "messages with links", "messages with links or files" */
+const keptKind = (limits: FetchLimits) => limits.onlyLinks ? limits.withFiles ? "messages with links or files" : "messages with links" : "messages";
+
+/** "600 messages with links", "1 message with links" */
+const countOf = (n: number, kind = "messages") => `${n.toLocaleString()} ${n === 1 ? kind.replace(/^messages/, "message") : kind}`;
 
 /** "12 from bob", "12 with links", "12 with links from bob", "12" */
-function keptText(n: number, author?: { name: string; }, onlyLinks?: boolean) {
-    return `${n.toLocaleString()}${onlyLinks ? " with links" : ""}${author ? ` from ${author.name}` : ""}`;
+function keptText(n: number, author: { name: string; } | undefined, limits: FetchLimits) {
+    return `${n.toLocaleString()}${keptKind(limits).slice("messages".length)}${author ? ` from ${author.name}` : ""}`;
 }
 
 async function fetchAll(channelId: string, state: ExportState, range: DateRange = {}, author?: { id: string; name: string; }, limits: FetchLimits = {}) {
@@ -312,7 +321,7 @@ async function fetchAll(channelId: string, state: ExportState, range: DateRange 
     let nextReport = every;
     /** false once the start of the chat (or the "from" date) was reached */
     let more = true;
-    const keep = keeper(author, limits.onlyLinks);
+    const keep = keeper(author, limits);
     const filtered = !!author || !!limits.onlyLinks;
 
     while (!state.cancelled && all.length < max) {
@@ -336,7 +345,7 @@ async function fetchAll(channelId: string, state: ExportState, range: DateRange 
         before = page[page.length - 1].id;
 
         if (state.scanned >= nextReport && progressToast(filtered
-            ? `Exporting... checked ${state.scanned.toLocaleString()} messages, ${keptText(all.length, author, limits.onlyLinks)} so far`
+            ? `Exporting... checked ${state.scanned.toLocaleString()} messages, ${keptText(all.length, author, limits)} so far`
             : `Exporting... ${all.length.toLocaleString()} messages so far`))
             nextReport = state.scanned + every;
         if (reachedStart || page.length < 100) {
@@ -386,6 +395,8 @@ interface SearchSummary {
     threadNotes: string[];
     /** set when "Max messages" cut the export short (only the newest this many were kept) */
     capped?: number;
+    /** what was kept: "messages", or "messages with links" for a links export */
+    kept?: string;
 }
 
 interface MessageGroup {
@@ -403,7 +414,7 @@ function emptyTargets(summary: SearchSummary, groups: MessageGroup[]) {
 /** what was left out and why, one line each */
 function skippedLines(summary: SearchSummary) {
     const lines: string[] = [];
-    if (summary.capped) lines.push(`Stopped at ${summary.capped.toLocaleString()} messages (your "Max messages" setting), so only the newest ones are in here.`);
+    if (summary.capped) lines.push(`Stopped at ${countOf(summary.capped, summary.kept)} (your "Max messages" setting), so only the newest ones are in here.`);
     if (summary.noAccess) lines.push(`Skipped ${summary.noAccess} channel${summary.noAccess === 1 ? "" : "s"} you can't open.`);
     for (const f of summary.failed) lines.push(`Couldn't read #${f.target.name}: ${f.why}.`);
     for (const n of summary.threadNotes) lines.push(`Threads: ${n}.`);
@@ -564,7 +575,7 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
         return baseMin && cmpId(baseMin, after) > 0 ? baseMin : after;
     };
     state.newestByTarget = new Map();
-    const keep = keeper(author, limits.onlyLinks);
+    const keep = keeper(author, limits);
     const TOP = "99999999999999999999";
     const min = (a: string, b: string) => cmpId(a, b) <= 0 ? a : b;
     summary.searched = targets;
@@ -665,7 +676,7 @@ async function fetchMany(targets: Target[], state: ExportState, summary: SearchS
         if (c.buf.length || !c.done) push(c);
         else state.channelsDone++;
 
-        if (state.scanned >= nextReport && progressToast(`Exporting all channels... checked ${state.scanned.toLocaleString()} messages, ${author || limits.onlyLinks ? keptText(state.count, author, limits.onlyLinks) : `kept ${state.count.toLocaleString()}`} so far (${state.channelsDone} of ${state.channelsTotal} channels done)`))
+        if (state.scanned >= nextReport && progressToast(`Exporting all channels... checked ${state.scanned.toLocaleString()} messages, ${author || limits.onlyLinks ? keptText(state.count, author, limits) : `kept ${state.count.toLocaleString()}`} so far (${state.channelsDone} of ${state.channelsTotal} channels done)`))
             nextReport = state.scanned + every;
     }
     // the limit cut it short while channels still had older messages
@@ -1208,10 +1219,16 @@ const plural = (n: number, word: string) => `${n.toLocaleString()} ${word}${n ==
 /** all channels' messages in the order they were posted (for "the different links, in the order they were first posted") */
 const inPostedOrder = (groups: MessageGroup[]) => groups.flatMap(g => g.messages).sort((a, b) => cmpId(a.id, b.id));
 
-/** "57 links (41 different) in 39 messages" */
-function linksSummary(messages: any[]) {
+/** " (1,653 different, 1,983 repeats)": the same link posted again counts every time it was posted, so this says how many are different */
+function repeatsNote(messages: any[]) {
     const { total, unique } = linkStats(messages);
-    return `${plural(total, "link")} (${unique.length.toLocaleString()} different) in ${plural(messages.length, "message")}`;
+    const repeats = total - unique.length;
+    return repeats ? ` (${unique.length.toLocaleString()} different, ${plural(repeats, "repeat")})` : "";
+}
+
+/** "3,636 links in 3,629 messages (1,653 different, 1,983 repeats)" */
+function linksSummary(messages: any[]) {
+    return `${plural(linkStats(messages).total, "link")} in ${plural(messages.length, "message")}${repeatsNote(messages)}`;
 }
 
 /** one message's links in the text layout: who and when, then one link per line */
@@ -1222,7 +1239,7 @@ function txtLinks(m: any) {
 /** the end of a links TXT: the totals, then every different link once (easy to copy) */
 function txtLinksEnd(messages: any[], extra: string[] = []) {
     const { unique } = linkStats(messages);
-    return `${RULE}\n${extra.map(l => l + "\n").join("")}${linksSummary(messages)}. All the different ones:\n${unique.join("\n")}\n${RULE}\n`;
+    return `${RULE}\n${extra.map(l => l + "\n").join("")}${linksSummary(messages)}.\nEach different link once (${unique.length.toLocaleString()}):\n${unique.join("\n")}\n${RULE}\n`;
 }
 
 function txtLinksHeader(info: ExportInfo, lines: string[]) {
@@ -1231,7 +1248,7 @@ function txtLinksHeader(info: ExportInfo, lines: string[]) {
     if (range.after) out.push(`After: ${dkDate(range.after)}\n`);
     if (range.before) out.push(`Before: ${dkDate(range.before)}\n`);
     if (author) out.push(`Only messages from: ${author.name}\n`);
-    out.push("Only links: the links people posted (uploaded files aren't included)\n", `${RULE}\n\n`);
+    out.push(`Only links: the links people posted${info.savedAs ? " (the files people sent are in the zip next to this)" : " (uploaded files aren't included)"}\n`, `${RULE}\n\n`);
     return out;
 }
 
@@ -1245,11 +1262,11 @@ function buildLinksTxt(channel: Channel, messages: any[], info: ExportInfo) {
 function buildLinksTxtAll(summary: SearchSummary, groups: MessageGroup[], info: ExportInfo) {
     const out = txtLinksHeader(info, [`Guild: ${summary.guildName}`, `Channels: all channels and threads you can read (${summary.searched.length} searched, ${groups.length} with links)`]);
     for (const g of groups) {
-        out.push(`${RULE}\nChannel: ${g.target.name} (${linksSummary(g.messages)})\n${RULE}\n\n`);
+        out.push(`${RULE}\nChannel: ${g.target.name} (${plural(linkStats(g.messages).total, "link")} in ${plural(g.messages.length, "message")})\n${RULE}\n\n`);
         for (const m of g.messages) out.push(txtLinks(m));
     }
     const empty = emptyTargets(summary, groups);
-    const extra = empty.length ? [`Also searched, no links found: ${empty.map(t => `#${t.name}`).join(", ")}`] : [];
+    const extra = empty.length ? [`Also searched, ${summary.capped ? "no links among the newest messages" : "no links found"}: ${empty.map(t => `#${t.name}`).join(", ")}`] : [];
     out.push(txtLinksEnd(inPostedOrder(groups), [...extra, ...skippedLines(summary)]));
     return out;
 }
@@ -1264,7 +1281,7 @@ function htmlLinks(messages: any[], guildId: string | null | undefined, channelI
 /** every different link once, folded away at the top */
 function htmlUniqueLinks(messages: any[]) {
     const { unique } = linkStats(messages);
-    return `<section class="toc"><details><summary>All ${unique.length.toLocaleString()} different links, in the order they were first posted</summary>`
+    return `<section class="toc"><details><summary>Each different link once (${unique.length.toLocaleString()}), in the order they were first posted</summary>`
         + unique.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`).join("<br>") + "</details></section>";
 }
 
@@ -1284,7 +1301,7 @@ function buildLinksHtmlAll(summary: SearchSummary, groups: MessageGroup[], info:
     for (const line of skippedLines(summary)) toc += `<div class="time">${esc(line)}</div>`;
     parts.push(toc + "</section>");
     for (const g of groups) {
-        parts.push(`<h2 class="chan" id="c${g.target.id}">#${esc(g.target.name)} <span>${esc(linksSummary(g.messages))}</span></h2>`);
+        parts.push(`<h2 class="chan" id="c${g.target.id}">#${esc(g.target.name)} <span>${plural(linkStats(g.messages).total, "link")} in ${plural(g.messages.length, "message")}</span></h2>`);
         parts.push(...htmlLinks(g.messages, summary.guildId, g.target.id));
     }
     parts.push(HTML_END);
@@ -1529,8 +1546,67 @@ function reporter(opts: ExportOptions, fallbackChannelId?: string) {
     };
 }
 
-function capNote(n: number) {
-    return `Stopped at ${n.toLocaleString()} messages (your "Max messages" setting), so these are the newest ${n.toLocaleString()}. Set it to 0 in the plugin settings for everything.`;
+function capNote(n: number, kept = "messages") {
+    return `Stopped at ${countOf(n, kept)} (your "Max messages" setting), so these are the newest ${n.toLocaleString()}. Set it to 0 in the plugin settings for everything.`;
+}
+
+// ---------- JSON ----------
+/** the lists in an export that can get huge */
+const LONG_LISTS = new Set(["messages", "channels", "links"]);
+
+/** something that holds one of those lists (the export itself, or one channel of an all-channels export) */
+const holdsLongList = (v: any) => !!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).some(k => LONG_LISTS.has(k) && Array.isArray(v[k]));
+
+/** JSON.stringify(v, null, 2) for a value that sits `depth` levels deep: wrapped in that many lists, JSON.stringify indents it itself */
+function indentedJson(v: any, depth: number): string {
+    if (!depth || v === null || typeof v !== "object") return JSON.stringify(v, null, 2) ?? "null";
+    let wrapped: any = v;
+    for (let i = 0; i < depth; i++) wrapped = [wrapped];
+    const s = JSON.stringify(wrapped, null, 2);
+    // cut off the wrapping: "[\n  [\n    " before it, "\n  ]\n]" after it
+    return s.slice(depth * 2 + depth * (depth + 1), s.length - (depth * 2 + depth * (depth - 1)));
+}
+
+/**
+ * The same text as JSON.stringify(value, null, 2), but in pieces of a few MB: JavaScript can't hold
+ * one piece of text over about 512 MB, which a JSON export of a few hundred thousand messages reaches.
+ */
+function jsonPieces(value: any): string[] {
+    const pieces: string[] = [];
+    let current: string[] = [];
+    let size = 0;
+    const put = (s: string) => {
+        current.push(s);
+        size += s.length;
+        if (size > 4_000_000) {
+            pieces.push(current.join(""));
+            current = [];
+            size = 0;
+        }
+    };
+    const walk = (v: any, depth: number) => {
+        const pad = "  ".repeat(depth);
+        if (Array.isArray(v) && v.length) {
+            put("[");
+            v.forEach((item, i) => {
+                put(`${i ? "," : ""}\n${pad}  `);
+                walk(item, depth + 1);
+            });
+            put(`\n${pad}]`);
+        } else if (holdsLongList(v)) {
+            // like JSON.stringify: properties that are undefined or functions are left out
+            const entries = Object.entries(v).filter(([, x]) => x !== undefined && typeof x !== "function");
+            put("{");
+            entries.forEach(([k, x], i) => {
+                put(`${i ? "," : ""}\n${pad}  ${JSON.stringify(k)}: `);
+                walk(x, depth + 1);
+            });
+            put(`\n${pad}}`);
+        } else put(indentedJson(v, depth)); // one message, or something small
+    };
+    walk(value, 0);
+    if (current.length) pieces.push(current.join(""));
+    return pieces;
 }
 
 /** the export file in the chosen format */
@@ -1610,10 +1686,12 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
     const report = reporter(opts, channel.id);
 
     try {
-        // links only: every message is read ("Max messages" doesn't apply), the ones with links are kept
-        const messages = await fetchAll(channel.id, state, range, author, { minId: since && nextId(since.upToId), noLimit: !!since || links, onlyLinks: links });
+        // links: only the messages with links are kept (with files: True also the ones with files, for the zip)
+        const limits: FetchLimits = { minId: since && nextId(since.upToId), noLimit: !!since, onlyLinks: links, withFiles: links && opts.files === true };
+        const kept = await fetchAll(channel.id, state, range, author, limits);
+        const messages = links ? kept.filter(m => messageLinks(m).length) : kept;
         // someone Discord hadn't loaded yet (left the server...) only had their id so far
-        if (author && author.name === author.id && messages[0]?.author?.username) author.name = messages[0].author.username;
+        if (author && author.name === author.id && kept[0]?.author?.username) author.name = kept[0].author.username;
         if (!messages.length) {
             const where = range.after || range.before ? " in that date range" : "";
             const from = author ? ` from ${author.name}` : "";
@@ -1628,18 +1706,18 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
             return;
         }
         if (state.hitCap) {
-            noteToast(capNote(messages.length));
-            report(capNote(messages.length));
+            noteToast(capNote(kept.length, keptKind(limits)));
+            report(capNote(kept.length, keptKind(limits)));
         }
         const { total, unique } = links ? linkStats(messages) : { total: 0, unique: [] };
         const savedWhat = links
-            ? `${plural(total, since ? "new link" : "link")} from ${plural(messages.length, "message")}`
+            ? `${plural(total, since ? "new link" : "link")} from ${plural(messages.length, "message")}${repeatsNote(messages)}`
             : `${messages.length.toLocaleString()}${since ? " new" : ""} message${messages.length === 1 ? "" : "s"}`;
-        // a links export is just the list: no files zip
-        const saved = await saveEverything(state, links ? { ...opts, files: false } : opts, report, messages, exportFileBase(channel, author, links), savedWhat, (fmt, info) => {
+        // a links export only downloads files when asked with files: True (then all of them, not just the ones in messages with links)
+        const saved = await saveEverything(state, links ? { ...opts, files: limits.withFiles } : opts, report, kept, exportFileBase(channel, author, links), savedWhat, (fmt, info) => {
             if (links) {
-                if (fmt === "json") {
-                    const json = JSON.stringify({
+                if (fmt === "json") return {
+                    parts: jsonPieces({
                         channel: { id: channel.id, name: channelTitle(channel), guild_id: channel.guild_id ?? null, type: channel.type },
                         exportedAt: new Date().toISOString(),
                         range: { after: range.after?.toISOString() ?? null, before: range.before?.toISOString() ?? null },
@@ -1649,23 +1727,23 @@ async function exportChannel(channel: Channel, opts: ExportOptions = {}) {
                         linkCount: total,
                         differentLinks: unique,
                         links: jsonLinks(messages, channel.guild_id, channel.id)
-                    }, null, 2);
-                    return { parts: [json], ext: ".json", mime: "application/json" };
-                }
+                    }),
+                    ext: ".json", mime: "application/json"
+                };
                 if (fmt === "txt") return { parts: buildLinksTxt(channel, messages, info), ext: ".txt", mime: "text/plain" };
                 return { parts: buildLinksHtml(channel, messages, info), ext: ".html", mime: "text/html" };
             }
-            if (fmt === "json") {
-                const json = JSON.stringify({
+            if (fmt === "json") return {
+                parts: jsonPieces({
                     channel: { id: channel.id, name: channelTitle(channel), guild_id: channel.guild_id ?? null, type: channel.type },
                     exportedAt: new Date().toISOString(),
                     range: { after: range.after?.toISOString() ?? null, before: range.before?.toISOString() ?? null },
                     onlyFrom: author ? { id: author.id, username: author.name } : null,
                     messageCount: messages.length,
                     messages
-                }, null, 2);
-                return { parts: [json], ext: ".json", mime: "application/json" };
-            }
+                }),
+                ext: ".json", mime: "application/json"
+            };
             if (fmt === "txt") return { parts: buildTxt(channel, messages, info), ext: ".txt", mime: "text/plain" };
             return { parts: buildHtml(channel, messages, info), ext: ".html", mime: "text/html" };
         });
@@ -1698,11 +1776,17 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
         const { targets, summary } = await findServerTargets(guildId, state, range);
         if (!state.cancelled)
             report(`Going through ${targets.length.toLocaleString()} channels and threads${summary.noAccess ? ` (skipping ${summary.noAccess} you can't open)` : ""}...`);
-        const groups = await fetchMany(targets, state, summary, range, author,
-            { minId: since && nextId(since.upToId), perTarget: since?.channels, noLimit: !!since || links, onlyLinks: links });
+        // links: only the messages with links are kept (with files: True also the ones with files, for the zip)
+        const limits: FetchLimits = { minId: since && nextId(since.upToId), noLimit: !!since, onlyLinks: links, withFiles: links && opts.files === true };
+        const keptGroups = await fetchMany(targets, state, summary, range, author, { ...limits, perTarget: since?.channels });
+        const kept = keptGroups.flatMap(g => g.messages);
+        const groups = links
+            ? keptGroups.map(g => ({ target: g.target, messages: g.messages.filter(m => messageLinks(m).length) })).filter(g => g.messages.length)
+            : keptGroups;
         const messages = groups.flatMap(g => g.messages);
-        if (author && author.name === author.id && messages[0]?.author?.username) author.name = messages[0].author.username;
-        if (state.hitCap) summary.capped = messages.length;
+        if (author && author.name === author.id && kept[0]?.author?.username) author.name = kept[0].author.username;
+        if (links) summary.kept = keptKind(limits);
+        if (state.hitCap) summary.capped = kept.length;
         const notes = skippedLines(summary);
         const inRange = range.after || range.before ? " in that date range" : "";
         const searched = `${summary.searched.length.toLocaleString()} channels and threads`;
@@ -1722,19 +1806,19 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
         const newWhen = since ? ` since your last ${links ? "links " : ""}export` : inRange;
         const had = links ? `links${from}` : author ? `messages from ${author.name}` : "messages";
         report([`Searched ${searched}, ${groups.length} had ${since ? "new " : ""}${had}${newWhen}.`, ...notes].join(" "));
-        if (state.hitCap) noteToast(capNote(messages.length));
+        if (state.hitCap) noteToast(capNote(kept.length, keptKind(limits)));
 
         const n = messages.length;
         const { total, unique } = links ? linkStats(inPostedOrder(groups)) : { total: 0, unique: [] };
         const inChannels = `from ${plural(groups.length, "channel")}`;
         const savedWhat = links
-            ? `${plural(total, since ? "new link" : "link")} ${inChannels}`
+            ? `${plural(total, since ? "new link" : "link")} ${inChannels}${repeatsNote(inPostedOrder(groups))}`
             : `${n.toLocaleString()}${since ? " new" : ""} message${n === 1 ? "" : "s"} ${inChannels}`;
-        // a links export is just the list: no files zip
-        const saved = await saveEverything(state, links ? { ...opts, files: false } : opts, report, messages, serverFileBase(summary.guildName, author, links), savedWhat, (fmt, info) => {
+        // a links export only downloads files when asked with files: True (then all of them, not just the ones in messages with links)
+        const saved = await saveEverything(state, links ? { ...opts, files: limits.withFiles } : opts, report, kept, serverFileBase(summary.guildName, author, links), savedWhat, (fmt, info) => {
             if (links) {
-                if (fmt === "json") {
-                    const json = JSON.stringify({
+                if (fmt === "json") return {
+                    parts: jsonPieces({
                         guild: { id: guildId, name: summary.guildName },
                         scope: "all channels and threads you can read",
                         exportedAt: new Date().toISOString(),
@@ -1747,14 +1831,14 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
                         differentLinks: unique,
                         notes,
                         links: groups.flatMap(g => jsonLinks(g.messages, guildId, g.target.id, g.target.name))
-                    }, null, 2);
-                    return { parts: [json], ext: ".json", mime: "application/json" };
-                }
+                    }),
+                    ext: ".json", mime: "application/json"
+                };
                 if (fmt === "txt") return { parts: buildLinksTxtAll(summary, groups, info), ext: ".txt", mime: "text/plain" };
                 return { parts: buildLinksHtmlAll(summary, groups, info), ext: ".html", mime: "text/html" };
             }
-            if (fmt === "json") {
-                const json = JSON.stringify({
+            if (fmt === "json") return {
+                parts: jsonPieces({
                     guild: { id: guildId, name: summary.guildName },
                     scope: "all channels and threads you can read",
                     exportedAt: new Date().toISOString(),
@@ -1771,9 +1855,9 @@ async function exportServer(guildId: string, opts: ExportOptions = {}) {
                         messageCount: g.messages.length,
                         messages: g.messages
                     }))
-                }, null, 2);
-                return { parts: [json], ext: ".json", mime: "application/json" };
-            }
+                }),
+                ext: ".json", mime: "application/json"
+            };
             if (fmt === "txt") return { parts: buildTxtAll(summary, groups, info), ext: ".txt", mime: "text/plain" };
             return { parts: buildHtmlAll(summary, groups, info), ext: ".html", mime: "text/html" };
         });
@@ -1928,13 +2012,13 @@ export default definePlugin({
                 },
                 {
                     name: "links",
-                    description: "True = only a list of the links people posted (whole chat, Max messages doesn't apply)",
+                    description: "True = just a list of the links people posted (who and when), not the messages",
                     type: OptionKind.BOOLEAN,
                     required: false
                 },
                 {
                     name: "files",
-                    description: "Download the files people sent into a .zip (default: your plugin setting, normally yes)",
+                    description: "Download the files people sent into a .zip (default: your setting, normally yes; with links: no)",
                     type: OptionKind.BOOLEAN,
                     required: false
                 },
@@ -1993,11 +2077,6 @@ export default definePlugin({
                 const author = userId ? { id: userId, name: getUser(userId)?.username ?? userId } : undefined;
                 const files = option<boolean>(args, "files");
                 const links = option<boolean>(args, "links", false) === true;
-                if (links && files === true) {
-                    botMessage(channel.id, "`links: True` only saves the list of links, so it doesn't download any files. Leave `files` empty, or do a normal export for the files.");
-                    return;
-                }
-
                 // since_last: carry on right after where the latest export here ended (see findMark); links exports have their own
                 let since: ExportMark | undefined;
                 let sinceOnlyFrom: string | undefined;
@@ -2018,9 +2097,10 @@ export default definePlugin({
                 const who = author ? links ? ` posted by ${author.name}` : ` (only messages from ${author.name})` : "";
                 const opts: ExportOptions = { format: fmt, fromCommand: true, reportTo: channel.id, range: parsed.range, author, files: typeof files === "boolean" ? files : undefined, since, sinceOnlyFrom, links };
                 const max = settings.store.maxMessages;
-                const limit = !max || since ? ""
-                    : links ? " Every message is read to find the links, so your \"Max messages\" setting doesn't apply."
-                        : ` Stops at ${max.toLocaleString()} messages (your "Max messages" setting), keeping the newest.`;
+                const kept = keptKind({ onlyLinks: links, withFiles: links && files === true });
+                const limit = max && !since ? ` Stops at ${countOf(max, kept)} (your "Max messages" setting), keeping the newest.` : "";
+                // with links, files only come along when asked for, and then it's every file people sent
+                const filesToo = links && files === true ? " The files people sent go into a .zip next to it." : "";
                 const what = describeRange(parsed.range, locale);
                 // "since your last export (Thu, 24 Sept 2026, 22:38, `Downloads\...html`)", plus whose messages it had if only one other person's
                 const lastOne = since && `since your last ${allChannels ? "all-channels " : ""}${links ? "links " : ""}export (${niceDate(new Date(since.at), locale)}${since.file ? `, \`${since.file}\`` : ""}`
@@ -2032,14 +2112,14 @@ export default definePlugin({
                     const scopeText = links
                         ? since ? `the new links in ${where} ${lastOne}` : `the links in ${where}${what}`
                         : since ? `everything new in ${where} ${lastOne}` : `${where}${what}`;
-                    botMessage(channel.id, `Export started: ${scopeText}. Big servers take a while, it has to read each channel.${limit} Run /exportchat again to cancel.${headsUp}`);
+                    botMessage(channel.id, `Export started: ${scopeText}.${filesToo} Big servers take a while, it has to read each channel.${limit} Run /exportchat again to cancel.${headsUp}`);
                     exportServer(channel.guild_id, opts);
                     return;
                 }
                 const scopeText = links
                     ? `: the ${since ? `new links${who} ${lastOne}` : `links${who}${what || " in the whole chat"}`}`
                     : since ? `${who}: everything new ${lastOne}` : `${who}${what || (author ? "" : " (the whole chat)")}`;
-                botMessage(channel.id, `Export started${scopeText}.${limit} Run /exportchat again to cancel.${headsUp}`);
+                botMessage(channel.id, `Export started${scopeText}.${filesToo}${limit} Run /exportchat again to cancel.${headsUp}`);
                 exportChannel(channel, opts);
             }
         }

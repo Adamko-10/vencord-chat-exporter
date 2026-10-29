@@ -113,11 +113,23 @@ export type ToastKind = "message" | "success" | "failure";
 
 let lastToast = { text: "", at: 0 };
 
+/** a name looked up by text, so a name Vencord removed doesn't even warn at build time */
+const lookup = (ns: any, name: string) => attempt(() => ns[name], undefined);
+
+/**
+ * Vencord changed pop-ups twice in October 2026: first the type constants went, then showToast itself
+ * became showToast({ text, variant, duration }). Old Vencord still has its Toasts object, new Vencord doesn't.
+ */
+const OLD_KIND = { message: "message", success: "success", failure: "failure" } as const;
+const NEW_KIND = { message: "default", success: "success", failure: "critical" } as const;
+
 /** a Discord pop-up; left out (with a console note) if Vencord or Discord changed them */
 export function showToast(msg: string, kind: ToastKind = "message", options?: { duration?: number; }) {
     lastToast = { text: msg, at: Date.now() };
     try {
-        Common.showToast(msg, kind, options);
+        const show = Common.showToast as any;
+        if (lookup(Common, "Toasts")) show(msg, OLD_KIND[kind], options);
+        else show({ text: msg, variant: NEW_KIND[kind], ...(options?.duration ? { duration: options.duration } : {}) });
     } catch (e) {
         warnOnce("Pop-ups", e);
     }
@@ -208,7 +220,7 @@ export function checkParts(hasNative: boolean): Part[] {
     const isFn = (get: () => unknown) => attempt(() => typeof get() === "function", false);
     return [
         { what: "Discord's API (RestAPI)", ok: isFn(() => Common.RestAPI.get), without: "nothing can be exported", essential: true },
-        { what: "pop-ups", ok: isFn(() => Common.showToast) && isFn(() => Common.Toasts.show), without: "no pop-ups (/exportchat's notes in the chat still work)" },
+        { what: "pop-ups", ok: isFn(() => Common.showToast), without: "no pop-ups (/exportchat's notes in the chat still work)" },
         { what: "notes in the chat", ok: isFn(() => Commands.sendBotMessage), without: "/exportchat's notes come as pop-ups" },
         { what: "saved data", ok: isFn(() => Storage.get) && isFn(() => Storage.set), without: "since_last forgets your exports when Discord restarts" },
         { what: "the server's channel list", ok: isFn(() => Common.ChannelStore.getMutableGuildChannelsForGuild), without: "\"all channels\" exports don't work (one channel at a time still does)" },
